@@ -1,0 +1,10 @@
+loguru
+mss
+numpy
+opencv-python
+pillow
+pyautogui
+PyGetWindow
+PyYAML
+keyboard
+paddleocr

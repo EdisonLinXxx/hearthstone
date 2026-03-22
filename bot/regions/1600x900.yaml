@@ -1,0 +1,116 @@
+window:
+  width: 1600
+  height: 900
+
+regions:
+  startup_entry:
+    x: 620
+    y: 730
+    w: 360
+    h: 120
+  main_battle_button:
+    x: 1210
+    y: 720
+    w: 250
+    h: 120
+  traditional_battle_button:
+    x: 650
+    y: 235
+    w: 290
+    h: 100
+  battle_menu:
+    x: 1080
+    y: 120
+    w: 380
+    h: 680
+  casual_mode_button:
+    x: 1080
+    y: 220
+    w: 320
+    h: 140
+  deck_selection:
+    x: 160
+    y: 160
+    w: 1280
+    h: 620
+  queue_play_button:
+    x: 1220
+    y: 740
+    w: 220
+    h: 100
+  battle_detector:
+    x: 650
+    y: 20
+    w: 300
+    h: 90
+  end_turn:
+    x: 1320
+    y: 360
+    w: 220
+    h: 140
+  mana:
+    x: 690
+    y: 756
+    w: 120
+    h: 72
+  my_hp:
+    x: 1110
+    y: 734
+    w: 100
+    h: 60
+  enemy_hp:
+    x: 1110
+    y: 102
+    w: 100
+    h: 60
+  hand:
+    x: 240
+    y: 590
+    w: 1120
+    h: 260
+  result_overlay:
+    x: 360
+    y: 120
+    w: 880
+    h: 600
+  result_banner:
+    x: 620
+    y: 500
+    w: 360
+    h: 120
+  result_continue_text:
+    x: 620
+    y: 760
+    w: 360
+    h: 90
+  result_continue_button:
+    x: 660
+    y: 690
+    w: 280
+    h: 120
+  confirm_button:
+    x: 660
+    y: 690
+    w: 280
+    h: 120
+  mulligan_confirm_button:
+    x: 660
+    y: 640
+    w: 300
+    h: 180
+  back_button:
+    x: 20
+    y: 20
+    w: 120
+    h: 80
+
+deck_slots:
+  1: {x: 360, y: 220}
+  2: {x: 360, y: 280}
+  3: {x: 360, y: 340}
+  4: {x: 360, y: 400}
+  5: {x: 360, y: 460}
+  6: {x: 360, y: 520}
+  7: {x: 360, y: 580}
+  8: {x: 360, y: 640}
+  9: {x: 360, y: 700}

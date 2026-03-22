@@ -1,0 +1,7 @@
+tag=deck_select
+title=炉石传说
+left=20
+top=20
+width=1440
+height=900
+profile=1440x900

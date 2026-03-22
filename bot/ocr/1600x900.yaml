@@ -1,0 +1,20 @@
+mana:
+  scale: 3
+  grayscale: true
+  threshold: 160
+  invert: false
+  whitelist: "0123456789/"
+
+my_hp:
+  scale: 3
+  grayscale: true
+  threshold: 155
+  invert: false
+  whitelist: "0123456789"
+
+enemy_hp:
+  scale: 3
+  grayscale: true
+  threshold: 155
+  invert: false
+  whitelist: "0123456789"

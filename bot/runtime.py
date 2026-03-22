@@ -1,0 +1,570 @@
+from __future__ import annotations
+
+import time
+from time import monotonic
+
+import cv2
+import numpy as np
+from loguru import logger
+
+from bot.action.hotkey import HotkeyController
+from bot.action.mouse import MouseController
+from bot.capture import WindowCapture
+from bot.config import RuntimeConfig
+from bot.ocr_config import load_ocr_config
+from bot.regions import load_deck_slots, load_regions
+from bot.strategy.rules import decide_action
+from bot.template_index import load_template_specs
+from bot.vision.board_state import BoardState, get_end_turn_active_score, parse_board_state
+from bot.vision.scene import SceneDetection, detect_scene
+
+
+class HearthstoneBot:
+    def __init__(self, config: RuntimeConfig) -> None:
+        self.config = config
+        self.capture = WindowCapture(config)
+        self.regions = load_regions(config.regions_path)
+        self.deck_slots = load_deck_slots(config.regions_path)
+        self.templates = load_template_specs(
+            config.templates_index_path,
+            config.templates_dir,
+        )
+        self.ocr_config = load_ocr_config(config.ocr_config_path)
+        self.mouse = MouseController(self.capture)
+        self.hotkeys = HotkeyController()
+        self._last_scene: str | None = None
+        self._battle_logged = False
+        self._queue_step = 0
+        self._pending_traditional_battle = False
+        self._last_battle_signature: tuple[int, tuple[int, ...]] | None = None
+        self._turn_action_count = 0
+        self._attempted_cards_this_turn: set[str] = set()
+        self._last_play_attempt_card_id: str | None = None
+        self._result_click_count = 0
+        self._last_queue_action_at = 0.0
+        self._battle_stall_count = 0
+        self._mulligan_grace_until = 0.0
+        self._unknown_result_suspect_count = 0
+        self._unknown_since = 0.0
+        self._last_battle_seen_at = 0.0
+        self._last_frame_signature: np.ndarray | None = None
+        self._last_frame_change_at = 0.0
+        self._last_progress_at = 0.0
+
+    def _board_play_target(self) -> tuple[int, int]:
+        return (
+            self.config.window_width // 2,
+            int(self.config.window_height * 0.48),
+        )
+
+    def _frame_signature(self, frame: np.ndarray) -> np.ndarray:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        resized = cv2.resize(gray, (48, 27), interpolation=cv2.INTER_AREA)
+        return resized
+
+    def _refresh_frame_change_timer(self, frame: np.ndarray, now: float) -> None:
+        signature = self._frame_signature(frame)
+        if self._last_frame_signature is None:
+            self._last_frame_signature = signature
+            self._last_frame_change_at = now
+            return
+        diff = cv2.absdiff(signature, self._last_frame_signature)
+        if float(diff.mean()) >= 2.0:
+            self._last_frame_change_at = now
+            self._last_frame_signature = signature
+
+    def _handle_stagnant_screen(self, now: float) -> bool:
+        if self._last_frame_change_at == 0.0:
+            return False
+        if now - self._last_frame_change_at < self.config.stagnant_timeout_seconds:
+            return False
+        logger.warning(
+            "Screen looks unchanged for {}s. Fallback click at safe point ({}, {}).",
+            round(now - self._last_frame_change_at, 1),
+            self.config.mouse_park_x,
+            self.config.mouse_park_y,
+        )
+        self.mouse.click_point(
+            self.config.mouse_park_x,
+            self.config.mouse_park_y,
+            pause_seconds=0.6,
+        )
+        self._park_mouse()
+        self._last_frame_change_at = now
+        return True
+
+    def _mark_progress(self, now: float) -> None:
+        self._last_progress_at = now
+
+    def _looks_like_result_screen(
+        self,
+        detection: SceneDetection,
+        board_state: BoardState | None,
+        now: float,
+    ) -> bool:
+        if detection.scene in {"result", "result_continue"}:
+            return True
+        if detection.scene != "unknown":
+            return False
+        if board_state is None:
+            return False
+        if board_state.end_turn_active_score >= 0.01:
+            return False
+        if len(board_state.hand_cards) > 0:
+            return False
+        if self._last_battle_seen_at == 0.0 or (now - self._last_battle_seen_at) >= 60.0:
+            return False
+        return (
+            detection.scores.get("result_banner", 0.0) >= 0.08
+            or detection.scores.get("result_continue_text", 0.0) >= 0.08
+            or detection.scores.get("confirm", 0.0) >= 0.10
+        )
+
+    def _handle_stagnant_progress(
+        self,
+        now: float,
+        detection: SceneDetection,
+        board_state: BoardState | None,
+    ) -> bool:
+        if self._last_progress_at == 0.0:
+            self._last_progress_at = now
+            return False
+        stagnant_for = now - self._last_progress_at
+        if stagnant_for < self.config.stagnant_timeout_seconds:
+            return False
+        if self._looks_like_result_screen(detection, board_state, now):
+            logger.warning(
+                "No progress for {}s and screen looks like result. Fallback click result continue button.",
+                round(stagnant_for, 1),
+            )
+            self.mouse.click_region(self.regions["result_continue_button"], pause_seconds=1.0)
+            self._park_mouse()
+            self._last_progress_at = now
+            return True
+        logger.warning(
+            "No progress for {}s. Fallback click at safe point ({}, {}).",
+            round(stagnant_for, 1),
+            self.config.mouse_park_x,
+            self.config.mouse_park_y,
+        )
+        self.mouse.click_point(
+            self.config.mouse_park_x,
+            self.config.mouse_park_y,
+            pause_seconds=0.6,
+        )
+        self._park_mouse()
+        self._last_progress_at = now
+        return True
+
+    def run(self) -> int:
+        logger.info(
+            "Starting bot with deck_index={}, profile={}, window={}x{} @ ({}, {}), mode={}, hotkey={}",
+            self.config.deck_index,
+            self.config.asset_profile,
+            self.config.window_width,
+            self.config.window_height,
+            self.config.window_x,
+            self.config.window_y,
+            self.config.mode,
+            self.config.stop_hotkey,
+        )
+        logger.info(
+            "Loaded {} regions, {} templates, {} OCR configs.",
+            len(self.regions),
+            len(self.templates),
+            len(self.ocr_config),
+        )
+        try:
+            self.hotkeys.clear()
+            self.hotkeys.register_stop_hotkey(self.config.stop_hotkey)
+            window = self.capture.move_window()
+            self.capture.validate_window(window)
+            self._last_progress_at = monotonic()
+            logger.info(
+                "Window ready: '{}' at ({}, {}) size={}x{}",
+                window.title,
+                window.left,
+                window.top,
+                window.width,
+                window.height,
+            )
+        except Exception as exc:
+            logger.error("Window setup failed: {}", exc)
+            return 1
+
+        logger.info("Stop hotkey registered: {}", self.config.stop_hotkey)
+        logger.info("Runtime flow is partially implemented: startup/menu/queue/result click flow is active.")
+
+        try:
+            while not self.hotkeys.stop_requested():
+                now = monotonic()
+                frame = self.capture.capture_window()
+                self._refresh_frame_change_timer(frame, now)
+                if self._handle_stagnant_screen(now):
+                    time.sleep(self.config.poll_interval_seconds)
+                    continue
+                detection = detect_scene(frame, self.regions, self.templates)
+                if detection.scene == "unknown":
+                    if self._unknown_since == 0.0:
+                        self._unknown_since = now
+                else:
+                    self._unknown_since = 0.0
+                if detection.scene == "battle":
+                    self._last_battle_seen_at = now
+                if (
+                    detection.scene == "unknown"
+                    and detection.scores.get("end_turn", 0.0) >= 0.78
+                    and detection.scores.get("result_banner", 0.0) < 0.35
+                    and detection.scores.get("result_continue_text", 0.0) < 0.35
+                    and monotonic() >= self._mulligan_grace_until
+                    and get_end_turn_active_score(frame, self.regions["end_turn"]) >= 0.015
+                ):
+                    detection = SceneDetection(
+                        scene="battle",
+                        scores=detection.scores,
+                        matches=detection.matches,
+                    )
+                if detection.scene != self._last_scene:
+                    logger.info("Current scene: {}", detection.scene)
+                    logger.info(
+                        "Scene scores: {}",
+                        {k: round(v, 3) for k, v in detection.scores.items()},
+                    )
+                    self._mark_progress(now)
+                    self._last_scene = detection.scene
+                    if detection.scene not in {"result", "result_continue"}:
+                        self._result_click_count = 0
+                    if detection.scene not in {"mulligan", "unknown"}:
+                        self._mulligan_grace_until = 0.0
+                    if detection.scene != "unknown":
+                        self._unknown_result_suspect_count = 0
+                        self._unknown_since = 0.0
+                    if detection.scene != "battle":
+                        self._battle_logged = False
+                        self._last_battle_signature = None
+                        self._turn_action_count = 0
+                        self._attempted_cards_this_turn.clear()
+                        self._last_play_attempt_card_id = None
+                        self._battle_stall_count = 0
+                    if detection.scene != "queue_page":
+                        self._last_queue_action_at = 0.0
+
+                if self._pending_traditional_battle:
+                    logger.info("Pending step: click traditional battle entry.")
+                    self._click_match(
+                        detection,
+                        "traditional_battle_button",
+                        fallback_region="traditional_battle_button",
+                        pause_seconds=1.0,
+                    )
+                    self._pending_traditional_battle = False
+                    self._queue_step = 1
+                    time.sleep(self.config.poll_interval_seconds)
+                    continue
+
+                board_state = None
+                unknown_board_state = None
+                end_turn_active_score = get_end_turn_active_score(frame, self.regions["end_turn"])
+                if detection.scene == "unknown" and now >= self._mulligan_grace_until:
+                    unknown_board_state = parse_board_state(
+                        frame=frame,
+                        regions=self.regions,
+                        ocr_config=self.ocr_config,
+                        detection=detection,
+                        end_turn_threshold=self.templates["end_turn"].threshold,
+                    )
+                    looks_like_result = (
+                        end_turn_active_score < 0.01
+                        and len(unknown_board_state.hand_cards) == 0
+                        and (now - self._last_battle_seen_at) < 20.0
+                        and (
+                            detection.scores.get("result_banner", 0.0) >= 0.22
+                            or detection.scores.get("result_continue_text", 0.0) >= 0.18
+                        )
+                    )
+                    if looks_like_result:
+                        self._unknown_result_suspect_count += 1
+                    else:
+                        self._unknown_result_suspect_count = 0
+                elif detection.scene == "unknown":
+                    self._unknown_result_suspect_count = 0
+                if detection.scene == "battle":
+                    board_state = parse_board_state(
+                        frame=frame,
+                        regions=self.regions,
+                        ocr_config=self.ocr_config,
+                        detection=detection,
+                        end_turn_threshold=self.templates["end_turn"].threshold,
+                    )
+                    if (
+                        not board_state.can_end_turn
+                        and len(board_state.hand_cards) == 0
+                        and (
+                            detection.scores.get("result_banner", 0.0) >= 0.12
+                            or detection.scores.get("result_continue_text", 0.0) >= 0.20
+                        )
+                    ):
+                        logger.info(
+                            "Battle scene looks like result screen. Force continue. banner_score={}, continue_score={}, end_turn_active_score={}",
+                            round(detection.scores.get("result_banner", 0.0), 3),
+                            round(detection.scores.get("result_continue_text", 0.0), 3),
+                            round(board_state.end_turn_active_score, 3),
+                        )
+                        self.mouse.click_region(self.regions["result_continue_button"], pause_seconds=1.0)
+                        self._park_mouse()
+                        self._battle_logged = False
+                        self._last_battle_signature = None
+                        self._turn_action_count = 0
+                        self._attempted_cards_this_turn.clear()
+                        self._last_play_attempt_card_id = None
+                        self._battle_stall_count = 0
+                        time.sleep(self.config.poll_interval_seconds)
+                        continue
+                    signature = (
+                        len(board_state.hand_cards),
+                        tuple(card.card_id for card in board_state.hand_cards),
+                    )
+                    if signature != self._last_battle_signature:
+                        if self._last_play_attempt_card_id and self._last_battle_signature is not None:
+                            self._attempted_cards_this_turn.discard(self._last_play_attempt_card_id)
+                        self._turn_action_count = 0
+                        self._last_battle_signature = signature
+                        self._battle_stall_count = 0
+                    elif self._last_play_attempt_card_id:
+                        self._attempted_cards_this_turn.add(self._last_play_attempt_card_id)
+                        self._last_play_attempt_card_id = None
+                        self._battle_stall_count += 1
+                    elif any(card.playable for card in board_state.hand_cards):
+                        self._battle_stall_count += 1
+                    logger.info(
+                        "Battle state: detected_cards={}, end_turn_active_score={}, stall_count={}, playable_scores={}, attempted={}",
+                        len(board_state.hand_cards),
+                        round(board_state.end_turn_active_score, 3),
+                        self._battle_stall_count,
+                        [
+                            {
+                                "id": card.card_id,
+                                "score": round(card.playable_score, 3),
+                                "playable": card.playable,
+                            }
+                            for card in board_state.hand_cards
+                        ],
+                        sorted(self._attempted_cards_this_turn),
+                    )
+                elif detection.scene == "unknown" and self._unknown_result_suspect_count >= 3:
+                    logger.info(
+                        "Unknown scene looks like result screen. Force continue. banner_score={}, continue_score={}, suspect_count={}, unknown_for={}s, last_battle={}s, detected_cards={}",
+                        round(detection.scores.get("result_banner", 0.0), 3),
+                        round(detection.scores.get("result_continue_text", 0.0), 3),
+                        self._unknown_result_suspect_count,
+                        round(now - self._unknown_since, 2) if self._unknown_since else 0.0,
+                        round(now - self._last_battle_seen_at, 2) if self._last_battle_seen_at else -1.0,
+                        len(unknown_board_state.hand_cards) if unknown_board_state is not None else -1,
+                    )
+                    self.mouse.click_region(self.regions["result_continue_button"], pause_seconds=1.0)
+                    self._park_mouse()
+                    self._mark_progress(now)
+                    self._unknown_result_suspect_count = 0
+                    time.sleep(self.config.poll_interval_seconds)
+                    continue
+
+                if self._handle_stagnant_progress(now, detection, board_state or unknown_board_state):
+                    time.sleep(self.config.poll_interval_seconds)
+                    continue
+
+                action = decide_action(
+                    scene=detection.scene,
+                    board_state=board_state,
+                    attempted_cards=self._attempted_cards_this_turn,
+                )
+                if (
+                    detection.scene == "battle"
+                    and board_state is not None
+                    and board_state.can_end_turn
+                    and self._battle_stall_count >= 6
+                ):
+                    logger.info("Battle stalled with playable candidates. Force end turn.")
+                    action = decide_action(
+                        scene="battle",
+                        board_state=BoardState(
+                            my_turn=True,
+                            can_end_turn=True,
+                            end_turn_active_score=board_state.end_turn_active_score,
+                            mana_current=board_state.mana_current,
+                            mana_total=board_state.mana_total,
+                            hand_cards=[],
+                        ),
+                        attempted_cards=self._attempted_cards_this_turn,
+                    )
+                if detection.scene == "battle":
+                    logger.info("Chosen action: {}", action.name)
+                if action.name == "click_startup":
+                    self._click_match(detection, "startup_entry", fallback_region="startup_entry", pause_seconds=1.0)
+                    self._mark_progress(now)
+                elif action.name == "click_main_battle":
+                    self._queue_step = 0
+                    self._pending_traditional_battle = True
+                    self._click_match(
+                        detection,
+                        "main_battle_button",
+                        fallback_region="main_battle_button",
+                        pause_seconds=1.0,
+                    )
+                    self._mark_progress(now)
+                elif action.name == "click_traditional_battle":
+                    self._queue_step = 1
+                    self._click_match(
+                        detection,
+                        "traditional_battle_button",
+                        fallback_region="traditional_battle_button",
+                        pause_seconds=1.0,
+                    )
+                    self._mark_progress(now)
+                elif action.name == "prepare_match":
+                    self._prepare_match(detection)
+                    self._mark_progress(now)
+                elif action.name == "confirm_mulligan":
+                    logger.info("Confirm mulligan.")
+                    self._mulligan_grace_until = monotonic() + 60.0
+                    self._click_match(
+                        detection,
+                        "mulligan_confirm",
+                        fallback_region="mulligan_confirm_button",
+                        pause_seconds=1.0,
+                    )
+                    self._mark_progress(now)
+                elif action.name == "continue_result":
+                    logger.info("Continue result screen.")
+                    self.mouse.click_region(self.regions["result_continue_button"], pause_seconds=1.0)
+                    self._park_mouse()
+                    self._mark_progress(now)
+                elif action.name == "confirm_result":
+                    self._handle_result(detection)
+                    self._mark_progress(now)
+                elif action.name == "battle_wait":
+                    if not self._battle_logged:
+                        logger.info("Battle scene reached. Battle automation is not implemented yet.")
+                        self._battle_logged = True
+                elif action.name == "play_card":
+                    if self._turn_action_count < self.config.max_actions_per_turn:
+                        drag_start = action.params["drag_start"]
+                        self._last_play_attempt_card_id = str(action.params["card_id"])
+                        logger.info(
+                            "Play card {} from {} with score={}",
+                            self._last_play_attempt_card_id,
+                            drag_start,
+                            round(float(action.params["playable_score"]), 3),
+                        )
+                        target = self._board_play_target()
+                        logger.info("Drag target: {}", target)
+                        self.mouse.drag(drag_start, target, duration=0.30)
+                        self._park_mouse()
+                        self._turn_action_count += 1
+                        self._mark_progress(now)
+                        time.sleep(0.8)
+                elif action.name == "end_turn":
+                    logger.info("End turn.")
+                    self._click_match(
+                        detection,
+                        "end_turn",
+                        fallback_region="end_turn",
+                        pause_seconds=0.8,
+                    )
+                    self._turn_action_count = 0
+                    self._attempted_cards_this_turn.clear()
+                    self._last_play_attempt_card_id = None
+                    self._battle_stall_count = 0
+                    self._mark_progress(now)
+                time.sleep(self.config.poll_interval_seconds)
+        finally:
+            self.hotkeys.cleanup()
+
+        logger.info("Bot stopped.")
+        return 0
+
+    def _park_mouse(self) -> None:
+        self.mouse.move_to_safe_point(
+            self.config.mouse_park_x,
+            self.config.mouse_park_y,
+        )
+
+    def _click_match(
+        self,
+        detection: SceneDetection,
+        match_name: str,
+        fallback_region: str,
+        pause_seconds: float,
+    ) -> None:
+        match = detection.matches.get(match_name)
+        if match is not None:
+            center_x = match.x + (match.width // 2)
+            center_y = match.y + (match.height // 2)
+            if match_name == "traditional_battle_button":
+                center_y += max(18, match.height // 3)
+            logger.info(
+                "Click match {} at ({}, {}) size={}x{} score={}",
+                match_name,
+                center_x,
+                center_y,
+                match.width,
+                match.height,
+                round(match.score, 3),
+            )
+            self.mouse.click_point(center_x, center_y, pause_seconds=pause_seconds)
+            self._park_mouse()
+            return
+        fallback = self.regions[fallback_region]
+        logger.info(
+            "Click fallback region {} at ({}, {}) size={}x{}",
+            fallback_region,
+            fallback.x + (fallback.w // 2),
+            fallback.y + (fallback.h // 2),
+            fallback.w,
+            fallback.h,
+        )
+        self.mouse.click_region(fallback, pause_seconds=pause_seconds)
+        self._park_mouse()
+
+    def _prepare_match(self, detection: SceneDetection) -> None:
+        now = monotonic()
+        if now - self._last_queue_action_at < 1.5:
+            return
+        deck_point = self.deck_slots.get(self.config.deck_index)
+        if deck_point is None:
+            raise RuntimeError(f"Deck slot {self.config.deck_index} is not configured.")
+        if self._queue_step == 0:
+            logger.info("Queue flow: click traditional battle entry.")
+            self._click_match(
+                detection,
+                "traditional_battle_button",
+                fallback_region="traditional_battle_button",
+                pause_seconds=1.0,
+            )
+            self._pending_traditional_battle = False
+            self._queue_step = 1
+            self._last_queue_action_at = monotonic()
+            return
+        logger.info("Queue flow: select deck {} and click play.", self.config.deck_index)
+        logger.info("Deck slot click point: {}", deck_point)
+        self.mouse.click_point(*deck_point, pause_seconds=0.6)
+        self._park_mouse()
+        self._click_match(
+            detection,
+            "queue_play_button",
+            fallback_region="queue_play_button",
+            pause_seconds=1.0,
+        )
+        self._last_queue_action_at = monotonic()
+
+    def _handle_result(self, detection: SceneDetection) -> None:
+        logger.info("Handling result screen.")
+        if self._result_click_count < self.config.max_result_clicks:
+            self._click_match(
+                detection,
+                "confirm",
+                fallback_region="confirm_button",
+                pause_seconds=0.8,
+            )
+            self._result_click_count += 1
+        self._pending_traditional_battle = False
+        self._queue_step = 1

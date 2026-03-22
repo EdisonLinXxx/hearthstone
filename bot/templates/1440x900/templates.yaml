@@ -1,0 +1,34 @@
+templates:
+  startup_entry:
+    file: startup_entry.png
+    threshold: 0.88
+  main_battle_button:
+    file: main_battle_button.png
+    threshold: 0.88
+  traditional_battle_button:
+    file: traditional_battle_button.png
+    threshold: 0.88
+  casual_mode_button:
+    file: casual_mode_button.png
+    threshold: 0.88
+  queue_play_button:
+    file: queue_play_button.png
+    threshold: 0.88
+  end_turn:
+    file: end_turn.png
+    threshold: 0.78
+  result_banner:
+    file: result_banner.png
+    threshold: 0.82
+  result_continue_text:
+    file: result_continue_text.png
+    threshold: 0.80
+  confirm:
+    file: confirm.png
+    threshold: 0.88
+  mulligan_confirm:
+    file: mulligan_confirm.png
+    threshold: 0.88
+  back_button:
+    file: back_button.png
+    threshold: 0.86
