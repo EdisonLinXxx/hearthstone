@@ -124,6 +124,7 @@ hand_detection:
   valid_x_max_ratio: 0.88
   valid_y_min_ratio: 0.50
   valid_y_max_ratio: 0.93
+  valid_bottom_min_ratio: 0.62
   min_area_ratio: 0.0018
   max_area_ratio: 0.035
   min_width_ratio: 0.018
@@ -137,6 +138,8 @@ hand_detection:
   wide_blob_peak_min_distance_ratio: 0.055
   wide_blob_peak_threshold_ratio: 0.52
   max_cards: 10
+  blacklist_left_max_ratio: 0.12
+  blacklist_bottom_min_ratio: 0.74
   center_probe_half_width_ratio: 0.038
   center_probe_up_ratio: 0.10
   center_probe_down_ratio: 0.14
@@ -149,4 +152,10 @@ hand_detection:
   playable_center_weight: 0.50
   playable_rim_weight: 0.35
   playable_brightness_weight: 0.15
+  card_band_weight: 0.36
+  card_green_weight: 0.16
+  card_bottom_weight: 0.32
+  card_height_weight: 0.16
+  card_threshold: 0.34
   playable_threshold: 0.20
+  drag_anchor_from_bottom_ratio: 0.24

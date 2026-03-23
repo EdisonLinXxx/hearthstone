@@ -50,6 +50,8 @@ class RuntimeConfig:
     max_result_clicks: int = 4
     max_actions_per_turn: int = 8
     stagnant_timeout_seconds: float = DEFAULT_STAGNANT_TIMEOUT_SECONDS
+    post_play_end_turn_delay_seconds: float = 3.0
+    end_turn_confirm_frames: int = 2
 
     @property
     def regions_path(self) -> Path:

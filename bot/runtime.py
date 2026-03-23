@@ -56,6 +56,8 @@ class HearthstoneBot:
         self._last_frame_signature: np.ndarray | None = None
         self._last_frame_change_at = 0.0
         self._last_progress_at = 0.0
+        self._end_turn_ready_at = 0.0
+        self._end_turn_confirm_count = 0
 
     def _board_play_target(self) -> tuple[int, int]:
         return (
@@ -152,10 +154,22 @@ class HearthstoneBot:
             return False
         if not self._has_recent_battle_context(now):
             return False
+        back_button_score = detection.scores.get("back_button", 0.0)
+        queue_play_score = detection.scores.get("queue_play_button", 0.0)
+        main_battle_score = detection.scores.get("main_battle_button", 0.0)
+        traditional_battle_score = detection.scores.get("traditional_battle_button", 0.0)
+        if back_button_score >= 0.86:
+            return False
+        if queue_play_score >= 0.12:
+            return False
+        if main_battle_score >= 0.70:
+            return False
+        if traditional_battle_score >= 0.70:
+            return False
         return (
-            detection.scores.get("result_banner", 0.0) >= 0.08
-            or detection.scores.get("result_continue_text", 0.0) >= 0.08
-            or detection.scores.get("confirm", 0.0) >= 0.10
+            detection.scores.get("result_banner", 0.0) >= 0.10
+            or detection.scores.get("result_continue_text", 0.0) >= 0.10
+            or detection.scores.get("confirm", 0.0) >= 0.22
         )
 
     def _looks_like_match_error(self, detection: SceneDetection, now: float) -> bool:
@@ -475,6 +489,10 @@ class HearthstoneBot:
                             self.hand_detection_config,
                         ),
                     )
+                    if board_state.can_end_turn and now >= self._end_turn_ready_at:
+                        self._end_turn_confirm_count += 1
+                    else:
+                        self._end_turn_confirm_count = 0
                 detection = self._normalize_scene_post_board(
                     detection=detection,
                     now=now,
@@ -504,6 +522,10 @@ class HearthstoneBot:
                         self._attempted_cards_this_turn.clear()
                         self._last_play_attempt_card_id = None
                         self._battle_stall_count = 0
+                        self._end_turn_ready_at = 0.0
+                        self._end_turn_confirm_count = 0
+                    if detection.scene in {"main_menu", "battle_menu", "queue_page", "matching"}:
+                        self._last_battle_seen_at = 0.0
                     if detection.scene not in {"queue_page", "matching", "match_error"}:
                         self._last_queue_action_at = 0.0
                 elif detection.scene == "unknown" and self._unknown_result_suspect_count >= 3:
@@ -553,6 +575,20 @@ class HearthstoneBot:
                     )
                 if detection.scene == "battle":
                     logger.info("Chosen action: {}", action.name)
+                if (
+                    action.name == "end_turn"
+                    and (
+                        now < self._end_turn_ready_at
+                        or self._end_turn_confirm_count < self.config.end_turn_confirm_frames
+                    )
+                ):
+                    logger.info(
+                        "Delay end turn. cooldown_left={}s, confirm_frames={}/{}",
+                        round(max(0.0, self._end_turn_ready_at - now), 2),
+                        self._end_turn_confirm_count,
+                        self.config.end_turn_confirm_frames,
+                    )
+                    action = decide_action(scene="matching")
                 if action.name == "click_startup":
                     self._click_match(detection, "startup_entry", fallback_region="startup_entry", pause_seconds=1.0)
                     self._mark_progress(now)
@@ -626,6 +662,8 @@ class HearthstoneBot:
                         self.mouse.drag(drag_start, target, duration=0.30)
                         self._park_mouse()
                         self._turn_action_count += 1
+                        self._end_turn_ready_at = monotonic() + self.config.post_play_end_turn_delay_seconds
+                        self._end_turn_confirm_count = 0
                         self._mark_progress(now)
                         time.sleep(0.8)
                 elif action.name == "end_turn":
@@ -640,6 +678,8 @@ class HearthstoneBot:
                     self._attempted_cards_this_turn.clear()
                     self._last_play_attempt_card_id = None
                     self._battle_stall_count = 0
+                    self._end_turn_ready_at = 0.0
+                    self._end_turn_confirm_count = 0
                     self._mark_progress(now)
                 time.sleep(self.config.poll_interval_seconds)
         finally:

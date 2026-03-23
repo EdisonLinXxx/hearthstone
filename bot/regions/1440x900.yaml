@@ -63,10 +63,10 @@ regions:
     w: 90
     h: 60
   hand:
-    x: 216
-    y: 590
-    w: 1008
-    h: 260
+    x: 260
+    y: 598
+    w: 944
+    h: 244
   result_overlay:
     x: 324
     y: 120
@@ -134,25 +134,28 @@ deck_slots:
 hand_detection:
   hsv_lower: [35, 90, 110]
   hsv_upper: [95, 255, 255]
-  close_kernel: 3
-  median_blur: 1
-  valid_x_min_ratio: 0.08
-  valid_x_max_ratio: 0.89
-  valid_y_min_ratio: 0.15
+  close_kernel: 5
+  median_blur: 3
+  valid_x_min_ratio: 0.10
+  valid_x_max_ratio: 0.87
+  valid_y_min_ratio: 0.18
   valid_y_max_ratio: 0.93
-  min_area_ratio: 0.0003
-  max_area_ratio: 0.06
-  min_width_ratio: 0.018
-  max_width_ratio: 0.22
-  min_height_ratio: 0.10
-  max_height_ratio: 0.42
-  min_aspect_ratio: 0.30
-  max_aspect_ratio: 2.05
+  valid_bottom_min_ratio: 0.60
+  min_area_ratio: 0.0006
+  max_area_ratio: 0.032
+  min_width_ratio: 0.020
+  max_width_ratio: 0.135
+  min_height_ratio: 0.14
+  max_height_ratio: 0.39
+  min_aspect_ratio: 0.34
+  max_aspect_ratio: 1.70
   dedupe_min_center_distance_ratio: 0.04
   wide_blob_min_width_ratio: 0.18
-  wide_blob_peak_min_distance_ratio: 0.045
-  wide_blob_peak_threshold_ratio: 0.40
+  wide_blob_peak_min_distance_ratio: 0.05
+  wide_blob_peak_threshold_ratio: 0.48
   max_cards: 10
+  blacklist_left_max_ratio: 0.14
+  blacklist_bottom_min_ratio: 0.72
   center_probe_half_width_ratio: 0.04
   center_probe_up_ratio: 0.10
   center_probe_down_ratio: 0.14
@@ -165,4 +168,10 @@ hand_detection:
   playable_center_weight: 0.50
   playable_rim_weight: 0.35
   playable_brightness_weight: 0.15
-  playable_threshold: 0.18
+  card_band_weight: 0.36
+  card_green_weight: 0.16
+  card_bottom_weight: 0.32
+  card_height_weight: 0.16
+  card_threshold: 0.34
+  playable_threshold: 0.20
+  drag_anchor_from_bottom_ratio: 0.24

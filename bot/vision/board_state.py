@@ -43,6 +43,7 @@ class HandCandidate:
 @dataclass(frozen=True)
 class ScoredHandCandidate:
     candidate: HandCandidate
+    card_score: float
     playable_score: float
     center_green_ratio: float
     rim_green_ratio: float
@@ -77,6 +78,10 @@ def _ratio_or_zero(mask: np.ndarray) -> float:
     return float(mask.mean())
 
 
+def _clamp01(value: float) -> float:
+    return max(0.0, min(1.0, value))
+
+
 def _build_hand_green_mask(hand_image: np.ndarray, config: HandDetectionConfig) -> np.ndarray:
     hsv = cv2.cvtColor(hand_image, cv2.COLOR_BGR2HSV)
     green_mask = cv2.inRange(hsv, config.hsv_lower, config.hsv_upper)
@@ -105,17 +110,25 @@ def _collect_raw_hand_candidates(
     min_height = int(height * config.min_height_ratio)
     max_height = int(height * config.max_height_ratio)
     wide_blob_min_width = int(width * config.wide_blob_min_width_ratio)
+    min_bottom = int(height * config.valid_bottom_min_ratio)
+    blacklist_left_max = int(width * config.blacklist_left_max_ratio)
+    blacklist_bottom_min = int(height * config.blacklist_bottom_min_ratio)
 
     num_labels, _, stats, _ = cv2.connectedComponentsWithStats(green_mask)
     candidates: list[HandCandidate] = []
     for index in range(1, num_labels):
         x, y, w, h, area = (int(value) for value in stats[index].tolist())
         center = (x + (w // 2), y + (h // 2))
+        bottom = y + h
         if center[0] < min_x or center[0] > max_x:
             continue
         if center[1] < min_y or center[1] > max_y:
             continue
         if h < min_height or h > max_height:
+            continue
+        if bottom < min_bottom:
+            continue
+        if center[0] <= blacklist_left_max and bottom >= blacklist_bottom_min:
             continue
         aspect_ratio = (w / h) if h else 0.0
         if area >= min_area and w >= min_width and w <= max_width:
@@ -394,6 +407,22 @@ def _score_playable_candidate(
         max(1, int(height * config.brightness_probe_up_ratio)),
         max(1, int(height * config.brightness_probe_down_ratio)),
     )
+    _, bbox_y, _, bbox_h = candidate.bbox
+    bottom_ratio = (bbox_y + bbox_h) / float(max(1, height))
+    height_ratio = bbox_h / float(max(1, height))
+    bottom_score = _clamp01(
+        (bottom_ratio - config.valid_bottom_min_ratio)
+        / max(0.05, 1.0 - config.valid_bottom_min_ratio),
+    )
+    height_mid = (config.min_height_ratio + config.max_height_ratio) / 2.0
+    height_span = max(0.04, (config.max_height_ratio - config.min_height_ratio) / 2.0)
+    height_score = _clamp01(1.0 - (abs(height_ratio - height_mid) / height_span))
+    card_score = (
+        (candidate.band_score * config.card_band_weight)
+        + (candidate.green_ratio * config.card_green_weight)
+        + (bottom_score * config.card_bottom_weight)
+        + (height_score * config.card_height_weight)
+    )
     playable_score = (
         (center_green_ratio * config.playable_center_weight)
         + (rim_green_ratio * config.playable_rim_weight)
@@ -401,6 +430,7 @@ def _score_playable_candidate(
     )
     return ScoredHandCandidate(
         candidate=candidate,
+        card_score=card_score,
         playable_score=playable_score,
         center_green_ratio=center_green_ratio,
         rim_green_ratio=rim_green_ratio,
@@ -416,17 +446,22 @@ def _candidate_to_hand_card(
     x, y = scored_candidate.candidate.center
     global_x = hand_region.x + x
     global_y = hand_region.y + y
-    bbox_x, bbox_y, bbox_w, bbox_h = scored_candidate.candidate.bbox
+    _, bbox_y, _, bbox_h = scored_candidate.candidate.bbox
+    anchor_offset = max(10, int(bbox_h * config.drag_anchor_from_bottom_ratio))
+    drag_y = hand_region.y + bbox_y + bbox_h - anchor_offset
     drag_start = (
         global_x,
-        min(hand_region.y + hand_region.h - 20, hand_region.y + bbox_y + bbox_h + 35),
+        max(hand_region.y + 8, min(hand_region.y + hand_region.h - 20, drag_y)),
     )
     return HandCard(
         card_id=f"{global_x}:{global_y}",
         anchor_center=(global_x, global_y),
         drag_start=drag_start,
         playable_score=scored_candidate.playable_score,
-        playable=scored_candidate.playable_score >= config.playable_threshold,
+        playable=(
+            scored_candidate.card_score >= config.card_threshold
+            and scored_candidate.playable_score >= config.playable_threshold
+        ),
     )
 
 
@@ -450,11 +485,15 @@ def build_hand_debug_entries(
                 "aspect_ratio": round(candidate.aspect_ratio, 3),
                 "green_ratio": round(candidate.green_ratio, 3),
                 "band_score": round(candidate.band_score, 3),
+                "card_score": round(scored.card_score, 3),
                 "center_green_ratio": round(scored.center_green_ratio, 3),
                 "rim_green_ratio": round(scored.rim_green_ratio, 3),
                 "local_brightness": round(scored.local_brightness, 3),
                 "playable_score": round(scored.playable_score, 3),
-                "playable": scored.playable_score >= hand_config.playable_threshold,
+                "playable": (
+                    scored.card_score >= hand_config.card_threshold
+                    and scored.playable_score >= hand_config.playable_threshold
+                ),
             }
         )
     return debug_entries

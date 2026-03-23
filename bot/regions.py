@@ -29,6 +29,7 @@ class HandDetectionConfig:
     max_width_ratio: float
     min_height_ratio: float
     max_height_ratio: float
+    valid_bottom_min_ratio: float
     min_aspect_ratio: float
     max_aspect_ratio: float
     dedupe_min_center_distance_ratio: float
@@ -36,6 +37,8 @@ class HandDetectionConfig:
     wide_blob_peak_min_distance_ratio: float
     wide_blob_peak_threshold_ratio: float
     max_cards: int
+    blacklist_left_max_ratio: float
+    blacklist_bottom_min_ratio: float
     center_probe_half_width_ratio: float
     center_probe_up_ratio: float
     center_probe_down_ratio: float
@@ -48,7 +51,13 @@ class HandDetectionConfig:
     playable_center_weight: float
     playable_rim_weight: float
     playable_brightness_weight: float
+    card_band_weight: float
+    card_green_weight: float
+    card_bottom_weight: float
+    card_height_weight: float
+    card_threshold: float
     playable_threshold: float
+    drag_anchor_from_bottom_ratio: float
 
 
 def load_regions(path) -> dict[str, Region]:
@@ -94,6 +103,7 @@ def load_hand_detection_config(path) -> HandDetectionConfig:
         max_width_ratio=float(raw["max_width_ratio"]),
         min_height_ratio=float(raw["min_height_ratio"]),
         max_height_ratio=float(raw["max_height_ratio"]),
+        valid_bottom_min_ratio=float(raw.get("valid_bottom_min_ratio", 0.60)),
         min_aspect_ratio=float(raw["min_aspect_ratio"]),
         max_aspect_ratio=float(raw["max_aspect_ratio"]),
         dedupe_min_center_distance_ratio=float(raw["dedupe_min_center_distance_ratio"]),
@@ -101,6 +111,8 @@ def load_hand_detection_config(path) -> HandDetectionConfig:
         wide_blob_peak_min_distance_ratio=float(raw["wide_blob_peak_min_distance_ratio"]),
         wide_blob_peak_threshold_ratio=float(raw["wide_blob_peak_threshold_ratio"]),
         max_cards=int(raw["max_cards"]),
+        blacklist_left_max_ratio=float(raw.get("blacklist_left_max_ratio", 0.0)),
+        blacklist_bottom_min_ratio=float(raw.get("blacklist_bottom_min_ratio", 1.0)),
         center_probe_half_width_ratio=float(raw["center_probe_half_width_ratio"]),
         center_probe_up_ratio=float(raw["center_probe_up_ratio"]),
         center_probe_down_ratio=float(raw["center_probe_down_ratio"]),
@@ -113,5 +125,11 @@ def load_hand_detection_config(path) -> HandDetectionConfig:
         playable_center_weight=float(raw["playable_center_weight"]),
         playable_rim_weight=float(raw["playable_rim_weight"]),
         playable_brightness_weight=float(raw["playable_brightness_weight"]),
+        card_band_weight=float(raw.get("card_band_weight", 0.35)),
+        card_green_weight=float(raw.get("card_green_weight", 0.20)),
+        card_bottom_weight=float(raw.get("card_bottom_weight", 0.30)),
+        card_height_weight=float(raw.get("card_height_weight", 0.15)),
+        card_threshold=float(raw.get("card_threshold", 0.28)),
         playable_threshold=float(raw["playable_threshold"]),
+        drag_anchor_from_bottom_ratio=float(raw.get("drag_anchor_from_bottom_ratio", 0.28)),
     )
