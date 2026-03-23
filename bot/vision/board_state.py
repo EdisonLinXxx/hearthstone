@@ -6,7 +6,7 @@ import cv2
 import numpy as np
 
 from bot.ocr_config import OcrRegionConfig
-from bot.regions import Region
+from bot.regions import HandDetectionConfig, Region
 from bot.vision.matcher import crop_region
 from bot.vision.scene import SceneDetection
 
@@ -30,56 +30,434 @@ class BoardState:
     hand_cards: list[HandCard]
 
 
-def _playable_score(frame: np.ndarray, anchor_center: tuple[int, int]) -> float:
-    x, y = anchor_center
-    y1 = max(0, y - 25)
-    y2 = min(frame.shape[0], y + 35)
-    x1 = max(0, x - 45)
-    x2 = min(frame.shape[1], x + 45)
-    roi = frame[y1:y2, x1:x2]
-    if roi.size == 0:
+@dataclass(frozen=True)
+class HandCandidate:
+    bbox: tuple[int, int, int, int]
+    center: tuple[int, int]
+    area: int
+    aspect_ratio: float
+    green_ratio: float
+    band_score: float
+
+
+@dataclass(frozen=True)
+class ScoredHandCandidate:
+    candidate: HandCandidate
+    playable_score: float
+    center_green_ratio: float
+    rim_green_ratio: float
+    local_brightness: float
+
+
+def _normalize_kernel_size(value: int) -> int:
+    return value if value % 2 == 1 else value + 1
+
+
+def _clip_roi(
+    width: int,
+    height: int,
+    center: tuple[int, int],
+    half_width: int,
+    up: int,
+    down: int,
+) -> tuple[int, int, int, int] | None:
+    x, y = center
+    x1 = max(0, x - half_width)
+    x2 = min(width, x + half_width)
+    y1 = max(0, y - up)
+    y2 = min(height, y + down)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return x1, y1, x2, y2
+
+
+def _ratio_or_zero(mask: np.ndarray) -> float:
+    if mask.size == 0:
         return 0.0
-    b, g, r = cv2.split(roi)
-    green_mask = (g > r + 20) & (g > b + 20) & (g > 120)
-    return float(green_mask.mean())
+    return float(mask.mean())
 
 
-def _detect_playable_cards(hand_image: np.ndarray) -> list[tuple[int, int, int, int]]:
+def _build_hand_green_mask(hand_image: np.ndarray, config: HandDetectionConfig) -> np.ndarray:
     hsv = cv2.cvtColor(hand_image, cv2.COLOR_BGR2HSV)
-    green_mask = cv2.inRange(hsv, (35, 90, 110), (95, 255, 255))
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    green_mask = cv2.inRange(hsv, config.hsv_lower, config.hsv_upper)
+    kernel_size = _normalize_kernel_size(max(1, config.close_kernel))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
     green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_CLOSE, kernel)
-    green_mask = cv2.medianBlur(green_mask, 7)
+    blur_size = _normalize_kernel_size(max(1, config.median_blur))
+    green_mask = cv2.medianBlur(green_mask, blur_size)
+    return green_mask
+
+
+def _collect_raw_hand_candidates(
+    hand_image: np.ndarray,
+    green_mask: np.ndarray,
+    config: HandDetectionConfig,
+) -> list[HandCandidate]:
+    height, width = hand_image.shape[:2]
+    min_x = int(width * config.valid_x_min_ratio)
+    max_x = int(width * config.valid_x_max_ratio)
+    min_y = int(height * config.valid_y_min_ratio)
+    max_y = int(height * config.valid_y_max_ratio)
+    min_area = int(width * height * config.min_area_ratio)
+    max_area = int(width * height * config.max_area_ratio)
+    min_width = int(width * config.min_width_ratio)
+    max_width = int(width * config.max_width_ratio)
+    min_height = int(height * config.min_height_ratio)
+    max_height = int(height * config.max_height_ratio)
+    wide_blob_min_width = int(width * config.wide_blob_min_width_ratio)
 
     num_labels, _, stats, _ = cv2.connectedComponentsWithStats(green_mask)
-    detections: list[tuple[int, int, int, int]] = []
+    candidates: list[HandCandidate] = []
     for index in range(1, num_labels):
-        x, y, w, h, area = stats[index].tolist()
-        if x < 150 or x > hand_image.shape[1] - 220:
+        x, y, w, h, area = (int(value) for value in stats[index].tolist())
+        center = (x + (w // 2), y + (h // 2))
+        if center[0] < min_x or center[0] > max_x:
             continue
-        if y < 140 or y > hand_image.shape[0] - 25:
+        if center[1] < min_y or center[1] > max_y:
             continue
-        if area < 700 or h < 28:
+        if h < min_height or h > max_height:
             continue
-        if w > 130:
-            split_count = min(3, max(2, round(w / 80)))
-            split_width = w / split_count
-            for i in range(split_count):
-                sx = int(x + (i * split_width))
-                sw = int(split_width)
-                detections.append((sx, y, sw, h))
-        else:
-            detections.append((x, y, w, h))
+        aspect_ratio = (w / h) if h else 0.0
+        if area >= min_area and w >= min_width and w <= max_width:
+            if aspect_ratio >= config.min_aspect_ratio and aspect_ratio <= config.max_aspect_ratio:
+                candidates.append(_build_hand_candidate(green_mask, x, y, w, h, area))
+                continue
+        if w >= wide_blob_min_width and aspect_ratio > config.max_aspect_ratio:
+            candidates.extend(
+                _split_wide_hand_blob(
+                    green_mask=green_mask,
+                    x=x,
+                    y=y,
+                    w=w,
+                    h=h,
+                    config=config,
+                    hand_width=width,
+                    min_area=min_area,
+                    min_width=min_width,
+                    max_width=max_width,
+                    min_height=min_height,
+                    max_area=max_area,
+                )
+            )
+    return candidates
 
-    merged: list[tuple[int, int, int, int]] = []
-    for x, y, w, h in sorted(detections, key=lambda item: item[0]):
-        center_x = x + (w // 2)
-        if any(abs(center_x - (existing_x + existing_w // 2)) < 42 for existing_x, _, existing_w, _ in merged):
+
+def _build_hand_candidate(
+    green_mask: np.ndarray,
+    x: int,
+    y: int,
+    w: int,
+    h: int,
+    area: int,
+) -> HandCandidate:
+    center = (x + (w // 2), y + (h // 2))
+    aspect_ratio = (w / h) if h else 0.0
+    roi = green_mask[y : y + h, x : x + w]
+    green_ratio = _ratio_or_zero(roi > 0)
+    band_top = y + max(0, int(h * 0.15))
+    band_bottom = y + max(1, int(h * 0.55))
+    band_bottom = min(green_mask.shape[0], band_bottom)
+    band_roi = green_mask[band_top:band_bottom, x : x + w]
+    band_score = _ratio_or_zero(band_roi > 0)
+    return HandCandidate(
+        bbox=(x, y, w, h),
+        center=center,
+        area=area,
+        aspect_ratio=aspect_ratio,
+        green_ratio=green_ratio,
+        band_score=band_score,
+    )
+
+
+def _extract_peak_positions(
+    profile: np.ndarray,
+    min_distance: int,
+    threshold_ratio: float,
+) -> list[int]:
+    if profile.size == 0:
+        return []
+    window = _normalize_kernel_size(max(3, min_distance // 2))
+    kernel = np.ones(window, dtype=np.float32) / float(window)
+    smooth = np.convolve(profile.astype(np.float32), kernel, mode="same")
+    peak_threshold = float(smooth.max()) * threshold_ratio
+    if peak_threshold <= 0.0:
+        return []
+    peak_indices: list[int] = []
+    for index in range(1, len(smooth) - 1):
+        value = float(smooth[index])
+        if value < peak_threshold:
             continue
-        merged.append((x, y, w, h))
-    if len(merged) > 10:
-        merged = merged[:10]
-    return merged
+        if value >= float(smooth[index - 1]) and value >= float(smooth[index + 1]):
+            peak_indices.append(index)
+    if not peak_indices:
+        peak_indices = [int(np.argmax(smooth))]
+    ranked = sorted(peak_indices, key=lambda idx: float(smooth[idx]), reverse=True)
+    chosen: list[int] = []
+    for index in ranked:
+        if any(abs(index - existing) < min_distance for existing in chosen):
+            continue
+        chosen.append(index)
+    return sorted(chosen)
+
+
+def _split_wide_hand_blob(
+    green_mask: np.ndarray,
+    x: int,
+    y: int,
+    w: int,
+    h: int,
+    config: HandDetectionConfig,
+    hand_width: int,
+    min_area: int,
+    min_width: int,
+    max_width: int,
+    min_height: int,
+    max_area: int,
+) -> list[HandCandidate]:
+    roi = (green_mask[y : y + h, x : x + w] > 0).astype(np.uint8)
+    if roi.size == 0:
+        return []
+    column_profile = roi.mean(axis=0)
+    min_distance = max(1, int(hand_width * config.wide_blob_peak_min_distance_ratio))
+    peaks = _extract_peak_positions(
+        profile=column_profile,
+        min_distance=min_distance,
+        threshold_ratio=config.wide_blob_peak_threshold_ratio,
+    )
+    if len(peaks) <= 1:
+        return []
+    boundaries = [0]
+    for left_peak, right_peak in zip(peaks, peaks[1:]):
+        boundaries.append((left_peak + right_peak) // 2)
+    boundaries.append(w)
+
+    split_candidates: list[HandCandidate] = []
+    for index, peak in enumerate(peaks):
+        local_left = boundaries[index]
+        local_right = boundaries[index + 1]
+        segment = roi[:, local_left:local_right]
+        if segment.size == 0:
+            continue
+        rows, cols = np.where(segment > 0)
+        if len(rows) == 0 or len(cols) == 0:
+            continue
+        seg_x1 = x + local_left + int(cols.min())
+        seg_x2 = x + local_left + int(cols.max()) + 1
+        seg_y1 = y + int(rows.min())
+        seg_y2 = y + int(rows.max()) + 1
+        seg_w = seg_x2 - seg_x1
+        seg_h = seg_y2 - seg_y1
+        seg_area = int(segment.sum())
+        if seg_w < max(6, min_width // 2):
+            continue
+        if seg_h < min_height:
+            continue
+        if seg_w > max_width:
+            continue
+        if seg_area < max(20, min_area // 2):
+            continue
+        if seg_area > max_area:
+            continue
+        split_candidates.append(
+            _build_hand_candidate(
+                green_mask=green_mask,
+                x=seg_x1,
+                y=seg_y1,
+                w=seg_w,
+                h=seg_h,
+                area=seg_area,
+            )
+        )
+    return split_candidates
+
+
+def _candidate_priority(candidate: HandCandidate) -> tuple[float, float, int]:
+    return (
+        candidate.band_score,
+        candidate.green_ratio,
+        candidate.area,
+    )
+
+
+def _dedupe_hand_candidates(
+    candidates: list[HandCandidate],
+    config: HandDetectionConfig,
+    hand_width: int,
+) -> list[HandCandidate]:
+    min_distance = max(1, int(hand_width * config.dedupe_min_center_distance_ratio))
+    deduped: list[HandCandidate] = []
+    for candidate in sorted(candidates, key=lambda item: item.center[0]):
+        if not deduped:
+            deduped.append(candidate)
+            continue
+        previous = deduped[-1]
+        previous_left = previous.bbox[0]
+        previous_right = previous.bbox[0] + previous.bbox[2]
+        candidate_left = candidate.bbox[0]
+        candidate_right = candidate.bbox[0] + candidate.bbox[2]
+        overlap = max(0, min(previous_right, candidate_right) - max(previous_left, candidate_left))
+        min_width = max(1, min(previous.bbox[2], candidate.bbox[2]))
+        overlap_ratio = overlap / min_width
+        contains_candidate = previous_left <= candidate_left and previous_right >= candidate_right
+        candidate_contains_previous = candidate_left <= previous_left and candidate_right >= previous_right
+        adaptive_distance = min(
+            min_distance,
+            max(12, int(min_width * 0.55)),
+        )
+        should_merge_nested = (
+            abs(candidate.center[0] - previous.center[0]) < min_distance
+            and overlap_ratio >= 0.85
+            and (contains_candidate or candidate_contains_previous)
+        )
+        should_merge_dense_overlap = (
+            abs(candidate.center[0] - previous.center[0]) < adaptive_distance
+            and overlap_ratio >= 0.35
+        )
+        if should_merge_nested or should_merge_dense_overlap:
+            if _candidate_priority(candidate) > _candidate_priority(previous):
+                deduped[-1] = candidate
+            continue
+        deduped.append(candidate)
+    return deduped[: config.max_cards]
+
+
+def _probe_green_ratio(
+    hsv_image: np.ndarray,
+    center: tuple[int, int],
+    half_width: int,
+    up: int,
+    down: int,
+    config: HandDetectionConfig,
+) -> float:
+    roi = _clip_roi(hsv_image.shape[1], hsv_image.shape[0], center, half_width, up, down)
+    if roi is None:
+        return 0.0
+    x1, y1, x2, y2 = roi
+    hsv_roi = hsv_image[y1:y2, x1:x2]
+    if hsv_roi.size == 0:
+        return 0.0
+    green_mask = cv2.inRange(hsv_roi, config.hsv_lower, config.hsv_upper) > 0
+    return _ratio_or_zero(green_mask)
+
+
+def _probe_brightness(
+    frame: np.ndarray,
+    center: tuple[int, int],
+    half_width: int,
+    up: int,
+    down: int,
+) -> float:
+    roi = _clip_roi(frame.shape[1], frame.shape[0], center, half_width, up, down)
+    if roi is None:
+        return 0.0
+    x1, y1, x2, y2 = roi
+    patch = frame[y1:y2, x1:x2]
+    if patch.size == 0:
+        return 0.0
+    hsv_patch = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+    return float(hsv_patch[:, :, 2].mean() / 255.0)
+
+
+def _score_playable_candidate(
+    hand_image: np.ndarray,
+    candidate: HandCandidate,
+    config: HandDetectionConfig,
+) -> ScoredHandCandidate:
+    height, width = hand_image.shape[:2]
+    hsv_image = cv2.cvtColor(hand_image, cv2.COLOR_BGR2HSV)
+    center = candidate.center
+
+    center_green_ratio = _probe_green_ratio(
+        hsv_image,
+        center,
+        max(2, int(width * config.center_probe_half_width_ratio)),
+        max(1, int(height * config.center_probe_up_ratio)),
+        max(1, int(height * config.center_probe_down_ratio)),
+        config,
+    )
+    rim_center = (
+        center[0],
+        max(0, center[1] - int(candidate.bbox[3] * 0.25)),
+    )
+    rim_green_ratio = _probe_green_ratio(
+        hsv_image,
+        rim_center,
+        max(2, int(width * config.rim_probe_half_width_ratio)),
+        max(1, int(height * config.rim_probe_top_ratio)),
+        max(1, int(height * config.rim_probe_height_ratio)),
+        config,
+    )
+    local_brightness = _probe_brightness(
+        hand_image,
+        center,
+        max(2, int(width * config.brightness_probe_half_width_ratio)),
+        max(1, int(height * config.brightness_probe_up_ratio)),
+        max(1, int(height * config.brightness_probe_down_ratio)),
+    )
+    playable_score = (
+        (center_green_ratio * config.playable_center_weight)
+        + (rim_green_ratio * config.playable_rim_weight)
+        + (local_brightness * config.playable_brightness_weight)
+    )
+    return ScoredHandCandidate(
+        candidate=candidate,
+        playable_score=playable_score,
+        center_green_ratio=center_green_ratio,
+        rim_green_ratio=rim_green_ratio,
+        local_brightness=local_brightness,
+    )
+
+
+def _candidate_to_hand_card(
+    hand_region: Region,
+    scored_candidate: ScoredHandCandidate,
+    config: HandDetectionConfig,
+) -> HandCard:
+    x, y = scored_candidate.candidate.center
+    global_x = hand_region.x + x
+    global_y = hand_region.y + y
+    bbox_x, bbox_y, bbox_w, bbox_h = scored_candidate.candidate.bbox
+    drag_start = (
+        global_x,
+        min(hand_region.y + hand_region.h - 20, hand_region.y + bbox_y + bbox_h + 35),
+    )
+    return HandCard(
+        card_id=f"{global_x}:{global_y}",
+        anchor_center=(global_x, global_y),
+        drag_start=drag_start,
+        playable_score=scored_candidate.playable_score,
+        playable=scored_candidate.playable_score >= config.playable_threshold,
+    )
+
+
+def build_hand_debug_entries(
+    frame: np.ndarray,
+    hand_region: Region,
+    hand_config: HandDetectionConfig,
+) -> list[dict[str, object]]:
+    hand_image = crop_region(frame, hand_region)
+    green_mask = _build_hand_green_mask(hand_image, hand_config)
+    raw_candidates = _collect_raw_hand_candidates(hand_image, green_mask, hand_config)
+    deduped_candidates = _dedupe_hand_candidates(raw_candidates, hand_config, hand_region.w)
+    debug_entries: list[dict[str, object]] = []
+    for candidate in deduped_candidates:
+        scored = _score_playable_candidate(hand_image, candidate, hand_config)
+        debug_entries.append(
+            {
+                "center": candidate.center,
+                "bbox": candidate.bbox,
+                "area": candidate.area,
+                "aspect_ratio": round(candidate.aspect_ratio, 3),
+                "green_ratio": round(candidate.green_ratio, 3),
+                "band_score": round(candidate.band_score, 3),
+                "center_green_ratio": round(scored.center_green_ratio, 3),
+                "rim_green_ratio": round(scored.rim_green_ratio, 3),
+                "local_brightness": round(scored.local_brightness, 3),
+                "playable_score": round(scored.playable_score, 3),
+                "playable": scored.playable_score >= hand_config.playable_threshold,
+            }
+        )
+    return debug_entries
 
 
 def _end_turn_active_score(frame: np.ndarray, end_turn_region: Region) -> float:
@@ -110,28 +488,22 @@ def parse_board_state(
     ocr_config: dict[str, OcrRegionConfig],
     detection: SceneDetection,
     end_turn_threshold: float,
+    hand_config: HandDetectionConfig,
 ) -> BoardState:
     del ocr_config
-    hand_image = crop_region(frame, regions["hand"])
-    visible_cards = _detect_playable_cards(hand_image)
-    hand_cards: list[HandCard] = []
-    for x, y, w, h in visible_cards:
-        global_x = regions["hand"].x + x + (w // 2)
-        global_y = regions["hand"].y + y + max(10, h // 2)
-        drag_start = (
-            global_x,
-            min(regions["hand"].y + regions["hand"].h - 20, regions["hand"].y + y + h + 35),
-        )
-        playable_score = _playable_score(frame, (global_x, global_y))
-        hand_cards.append(
-            HandCard(
-                card_id=f"{global_x}:{global_y}",
-                anchor_center=(global_x, global_y),
-                drag_start=drag_start,
-                playable_score=playable_score,
-                playable=playable_score >= 0.20,
-            )
-        )
+    hand_region = regions["hand"]
+    hand_image = crop_region(frame, hand_region)
+    green_mask = _build_hand_green_mask(hand_image, hand_config)
+    raw_candidates = _collect_raw_hand_candidates(hand_image, green_mask, hand_config)
+    candidates = _dedupe_hand_candidates(raw_candidates, hand_config, hand_region.w)
+    scored_candidates = [
+        _score_playable_candidate(hand_image, candidate, hand_config)
+        for candidate in candidates
+    ]
+    hand_cards = [
+        _candidate_to_hand_card(hand_region, scored_candidate, hand_config)
+        for scored_candidate in scored_candidates
+    ]
 
     end_turn_score = detection.scores.get("end_turn", 0.0)
     active_score = _end_turn_active_score(frame, regions["end_turn"])

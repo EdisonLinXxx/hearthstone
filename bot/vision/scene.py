@@ -72,7 +72,7 @@ def detect_scene(
     ):
         scene = "result_continue"
     elif scores["confirm"] >= specs["confirm"].threshold:
-        scene = "result"
+        scene = "confirm_dialog"
     elif scores["end_turn"] >= specs["end_turn"].threshold:
         scene = "battle"
     elif (

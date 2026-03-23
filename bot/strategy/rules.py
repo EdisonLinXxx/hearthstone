@@ -26,6 +26,8 @@ def decide_action(
         return Action("confirm_mulligan")
     if scene == "queue_page":
         return Action("prepare_match")
+    if scene == "match_error":
+        return Action("confirm_match_error")
     if scene == "result_continue":
         return Action("continue_result")
     if scene == "result":

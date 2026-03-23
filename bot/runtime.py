@@ -12,10 +12,15 @@ from bot.action.mouse import MouseController
 from bot.capture import WindowCapture
 from bot.config import RuntimeConfig
 from bot.ocr_config import load_ocr_config
-from bot.regions import load_deck_slots, load_regions
+from bot.regions import load_deck_slots, load_hand_detection_config, load_regions
 from bot.strategy.rules import decide_action
 from bot.template_index import load_template_specs
-from bot.vision.board_state import BoardState, get_end_turn_active_score, parse_board_state
+from bot.vision.board_state import (
+    BoardState,
+    build_hand_debug_entries,
+    get_end_turn_active_score,
+    parse_board_state,
+)
 from bot.vision.scene import SceneDetection, detect_scene
 
 
@@ -25,6 +30,7 @@ class HearthstoneBot:
         self.capture = WindowCapture(config)
         self.regions = load_regions(config.regions_path)
         self.deck_slots = load_deck_slots(config.regions_path)
+        self.hand_detection_config = load_hand_detection_config(config.regions_path)
         self.templates = load_template_specs(
             config.templates_index_path,
             config.templates_dir,
@@ -96,7 +102,39 @@ class HearthstoneBot:
     def _mark_progress(self, now: float) -> None:
         self._last_progress_at = now
 
-    def _looks_like_result_screen(
+    def _log_scene_normalization(
+        self,
+        from_scene: str,
+        to_scene: str,
+        reason: str,
+        detection: SceneDetection,
+    ) -> None:
+        if from_scene == to_scene:
+            return
+        logger.info(
+            "Scene normalized: {} -> {} ({}) scores={{confirm: {}, result_banner: {}, result_continue_text: {}, end_turn: {}, back_button: {}, queue_play_button: {}}}",
+            from_scene,
+            to_scene,
+            reason,
+            round(detection.scores.get("confirm", 0.0), 3),
+            round(detection.scores.get("result_banner", 0.0), 3),
+            round(detection.scores.get("result_continue_text", 0.0), 3),
+            round(detection.scores.get("end_turn", 0.0), 3),
+            round(detection.scores.get("back_button", 0.0), 3),
+            round(detection.scores.get("queue_play_button", 0.0), 3),
+        )
+
+    def _has_recent_battle_context(self, now: float, timeout_seconds: float = 60.0) -> bool:
+        return self._last_battle_seen_at > 0.0 and (now - self._last_battle_seen_at) < timeout_seconds
+
+    def _has_active_queue_context(self, now: float, timeout_seconds: float = 45.0) -> bool:
+        return (
+            self._queue_step >= 1
+            and self._last_queue_action_at > 0.0
+            and (now - self._last_queue_action_at) < timeout_seconds
+        )
+
+    def _looks_like_result_overlay(
         self,
         detection: SceneDetection,
         board_state: BoardState | None,
@@ -104,7 +142,7 @@ class HearthstoneBot:
     ) -> bool:
         if detection.scene in {"result", "result_continue"}:
             return True
-        if detection.scene != "unknown":
+        if detection.scene not in {"unknown", "battle", "confirm_dialog"}:
             return False
         if board_state is None:
             return False
@@ -112,13 +150,125 @@ class HearthstoneBot:
             return False
         if len(board_state.hand_cards) > 0:
             return False
-        if self._last_battle_seen_at == 0.0 or (now - self._last_battle_seen_at) >= 60.0:
+        if not self._has_recent_battle_context(now):
             return False
         return (
             detection.scores.get("result_banner", 0.0) >= 0.08
             or detection.scores.get("result_continue_text", 0.0) >= 0.08
             or detection.scores.get("confirm", 0.0) >= 0.10
         )
+
+    def _looks_like_match_error(self, detection: SceneDetection, now: float) -> bool:
+        if not self._has_active_queue_context(now):
+            return False
+        if detection.scores.get("result_banner", 0.0) >= 0.35:
+            return False
+        if detection.scores.get("result_continue_text", 0.0) >= 0.35:
+            return False
+        confirm_score = detection.scores.get("confirm", 0.0)
+        back_button_score = detection.scores.get("back_button", 0.0)
+        queue_play_score = detection.scores.get("queue_play_button", 0.0)
+        strong_confirm_match = confirm_score >= self.templates["confirm"].threshold
+        relaxed_queue_error_match = (
+            confirm_score >= 0.14
+            and back_button_score >= 0.85
+            and queue_play_score >= 0.12
+        )
+        return strong_confirm_match or relaxed_queue_error_match
+
+    def _match_error_reason(self, detection: SceneDetection) -> str:
+        confirm_score = detection.scores.get("confirm", 0.0)
+        back_button_score = detection.scores.get("back_button", 0.0)
+        queue_play_score = detection.scores.get("queue_play_button", 0.0)
+        if confirm_score >= self.templates["confirm"].threshold:
+            return "strong confirm template"
+        if confirm_score >= 0.14 and back_button_score >= 0.85 and queue_play_score >= 0.12:
+            return "relaxed queue confirm"
+        return "queue context confirm dialog"
+
+    def _looks_like_result_confirm(self, detection: SceneDetection, now: float) -> bool:
+        if detection.scores.get("confirm", 0.0) < self.templates["confirm"].threshold:
+            return False
+        if self._looks_like_match_error(detection, now):
+            return False
+        if self._has_active_queue_context(now):
+            return False
+        if self._has_recent_battle_context(now, timeout_seconds=120.0):
+            return True
+        return (
+            self._result_click_count > 0
+            or detection.scores.get("result_banner", 0.0) >= 0.05
+            or detection.scores.get("result_continue_text", 0.0) >= 0.05
+        )
+
+    def _should_promote_unknown_to_battle(
+        self,
+        detection: SceneDetection,
+        frame: np.ndarray,
+    ) -> bool:
+        return (
+            detection.scene == "unknown"
+            and detection.scores.get("end_turn", 0.0) >= 0.78
+            and detection.scores.get("result_banner", 0.0) < 0.35
+            and detection.scores.get("result_continue_text", 0.0) < 0.35
+            and monotonic() >= self._mulligan_grace_until
+            and get_end_turn_active_score(frame, self.regions["end_turn"]) >= 0.015
+        )
+
+    def _normalize_scene_pre_board(
+        self,
+        detection: SceneDetection,
+        frame: np.ndarray,
+        now: float,
+    ) -> SceneDetection:
+        if self._should_promote_unknown_to_battle(detection, frame):
+            normalized = SceneDetection(
+                scene="battle",
+                scores=detection.scores,
+                matches=detection.matches,
+            )
+            self._log_scene_normalization(detection.scene, normalized.scene, "unknown promoted by end_turn active", detection)
+            return normalized
+        if detection.scene == "confirm_dialog" and self._looks_like_match_error(detection, now):
+            normalized = SceneDetection(
+                scene="match_error",
+                scores=detection.scores,
+                matches=detection.matches,
+            )
+            self._log_scene_normalization(
+                detection.scene,
+                normalized.scene,
+                self._match_error_reason(detection),
+                detection,
+            )
+            return normalized
+        return detection
+
+    def _normalize_scene_post_board(
+        self,
+        detection: SceneDetection,
+        now: float,
+        board_state: BoardState | None,
+    ) -> SceneDetection:
+        if detection.scene == "confirm_dialog":
+            if self._looks_like_result_confirm(detection, now):
+                normalized = SceneDetection(
+                    scene="result",
+                    scores=detection.scores,
+                    matches=detection.matches,
+                )
+                self._log_scene_normalization(detection.scene, normalized.scene, "result confirm dialog", detection)
+                return normalized
+            return detection
+        if detection.scene in {"unknown", "battle"} and self._looks_like_result_overlay(detection, board_state, now):
+            normalized = SceneDetection(
+                scene="result_continue",
+                scores=detection.scores,
+                matches=detection.matches,
+            )
+            self._log_scene_normalization(detection.scene, normalized.scene, "result overlay after battle", detection)
+            return normalized
+        return detection
 
     def _handle_stagnant_progress(
         self,
@@ -132,7 +282,7 @@ class HearthstoneBot:
         stagnant_for = now - self._last_progress_at
         if stagnant_for < self.config.stagnant_timeout_seconds:
             return False
-        if self._looks_like_result_screen(detection, board_state, now):
+        if self._looks_like_result_overlay(detection, board_state, now):
             logger.warning(
                 "No progress for {}s and screen looks like result. Fallback click result continue button.",
                 round(stagnant_for, 1),
@@ -211,43 +361,7 @@ class HearthstoneBot:
                     self._unknown_since = 0.0
                 if detection.scene == "battle":
                     self._last_battle_seen_at = now
-                if (
-                    detection.scene == "unknown"
-                    and detection.scores.get("end_turn", 0.0) >= 0.78
-                    and detection.scores.get("result_banner", 0.0) < 0.35
-                    and detection.scores.get("result_continue_text", 0.0) < 0.35
-                    and monotonic() >= self._mulligan_grace_until
-                    and get_end_turn_active_score(frame, self.regions["end_turn"]) >= 0.015
-                ):
-                    detection = SceneDetection(
-                        scene="battle",
-                        scores=detection.scores,
-                        matches=detection.matches,
-                    )
-                if detection.scene != self._last_scene:
-                    logger.info("Current scene: {}", detection.scene)
-                    logger.info(
-                        "Scene scores: {}",
-                        {k: round(v, 3) for k, v in detection.scores.items()},
-                    )
-                    self._mark_progress(now)
-                    self._last_scene = detection.scene
-                    if detection.scene not in {"result", "result_continue"}:
-                        self._result_click_count = 0
-                    if detection.scene not in {"mulligan", "unknown"}:
-                        self._mulligan_grace_until = 0.0
-                    if detection.scene != "unknown":
-                        self._unknown_result_suspect_count = 0
-                        self._unknown_since = 0.0
-                    if detection.scene != "battle":
-                        self._battle_logged = False
-                        self._last_battle_signature = None
-                        self._turn_action_count = 0
-                        self._attempted_cards_this_turn.clear()
-                        self._last_play_attempt_card_id = None
-                        self._battle_stall_count = 0
-                    if detection.scene != "queue_page":
-                        self._last_queue_action_at = 0.0
+                detection = self._normalize_scene_pre_board(detection, frame, now)
 
                 if self._pending_traditional_battle:
                     logger.info("Pending step: click traditional battle entry.")
@@ -272,6 +386,7 @@ class HearthstoneBot:
                         ocr_config=self.ocr_config,
                         detection=detection,
                         end_turn_threshold=self.templates["end_turn"].threshold,
+                        hand_config=self.hand_detection_config,
                     )
                     looks_like_result = (
                         end_turn_active_score < 0.01
@@ -295,6 +410,7 @@ class HearthstoneBot:
                         ocr_config=self.ocr_config,
                         detection=detection,
                         end_turn_threshold=self.templates["end_turn"].threshold,
+                        hand_config=self.hand_detection_config,
                     )
                     if (
                         not board_state.can_end_turn
@@ -351,6 +467,45 @@ class HearthstoneBot:
                         ],
                         sorted(self._attempted_cards_this_turn),
                     )
+                    logger.debug(
+                        "Battle hand detection: {}",
+                        build_hand_debug_entries(
+                            frame,
+                            self.regions["hand"],
+                            self.hand_detection_config,
+                        ),
+                    )
+                detection = self._normalize_scene_post_board(
+                    detection=detection,
+                    now=now,
+                    board_state=board_state or unknown_board_state,
+                )
+                if detection.scene == "battle":
+                    self._last_battle_seen_at = now
+                if detection.scene != self._last_scene:
+                    logger.info("Current scene: {}", detection.scene)
+                    logger.info(
+                        "Scene scores: {}",
+                        {k: round(v, 3) for k, v in detection.scores.items()},
+                    )
+                    self._mark_progress(now)
+                    self._last_scene = detection.scene
+                    if detection.scene not in {"result", "result_continue"}:
+                        self._result_click_count = 0
+                    if detection.scene not in {"mulligan", "unknown"}:
+                        self._mulligan_grace_until = 0.0
+                    if detection.scene != "unknown":
+                        self._unknown_result_suspect_count = 0
+                        self._unknown_since = 0.0
+                    if detection.scene != "battle":
+                        self._battle_logged = False
+                        self._last_battle_signature = None
+                        self._turn_action_count = 0
+                        self._attempted_cards_this_turn.clear()
+                        self._last_play_attempt_card_id = None
+                        self._battle_stall_count = 0
+                    if detection.scene not in {"queue_page", "matching", "match_error"}:
+                        self._last_queue_action_at = 0.0
                 elif detection.scene == "unknown" and self._unknown_result_suspect_count >= 3:
                     logger.info(
                         "Unknown scene looks like result screen. Force continue. banner_score={}, continue_score={}, suspect_count={}, unknown_for={}s, last_battle={}s, detected_cards={}",
@@ -422,6 +577,17 @@ class HearthstoneBot:
                     self._mark_progress(now)
                 elif action.name == "prepare_match":
                     self._prepare_match(detection)
+                    self._mark_progress(now)
+                elif action.name == "confirm_match_error":
+                    logger.info("Confirm queue match error dialog.")
+                    self._click_match(
+                        detection,
+                        "confirm",
+                        fallback_region="confirm_button",
+                        pause_seconds=0.8,
+                    )
+                    self._queue_step = 1
+                    self._last_queue_action_at = 0.0
                     self._mark_progress(now)
                 elif action.name == "confirm_mulligan":
                     logger.info("Confirm mulligan.")

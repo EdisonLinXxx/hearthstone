@@ -114,3 +114,39 @@ deck_slots:
   7: {x: 360, y: 580}
   8: {x: 360, y: 640}
   9: {x: 360, y: 700}
+
+hand_detection:
+  hsv_lower: [35, 90, 110]
+  hsv_upper: [95, 255, 255]
+  close_kernel: 9
+  median_blur: 7
+  valid_x_min_ratio: 0.13
+  valid_x_max_ratio: 0.88
+  valid_y_min_ratio: 0.50
+  valid_y_max_ratio: 0.93
+  min_area_ratio: 0.0018
+  max_area_ratio: 0.035
+  min_width_ratio: 0.018
+  max_width_ratio: 0.115
+  min_height_ratio: 0.10
+  max_height_ratio: 0.42
+  min_aspect_ratio: 0.32
+  max_aspect_ratio: 1.95
+  dedupe_min_center_distance_ratio: 0.05
+  wide_blob_min_width_ratio: 0.18
+  wide_blob_peak_min_distance_ratio: 0.055
+  wide_blob_peak_threshold_ratio: 0.52
+  max_cards: 10
+  center_probe_half_width_ratio: 0.038
+  center_probe_up_ratio: 0.10
+  center_probe_down_ratio: 0.14
+  rim_probe_half_width_ratio: 0.045
+  rim_probe_top_ratio: 0.14
+  rim_probe_height_ratio: 0.10
+  brightness_probe_half_width_ratio: 0.05
+  brightness_probe_up_ratio: 0.12
+  brightness_probe_down_ratio: 0.16
+  playable_center_weight: 0.50
+  playable_rim_weight: 0.35
+  playable_brightness_weight: 0.15
+  playable_threshold: 0.20
