@@ -1,0 +1,13 @@
+tag=ocr_auto_turn_end
+title=炉石传说
+left=20
+top=20
+width=1440
+height=900
+profile=1440x900
+scene=battle_end_turn
+can_end_turn=True
+end_turn_active_score=0.096
+detected_cards=2
+card_ids=436:842,493:824
+cost_crop_count=2

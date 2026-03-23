@@ -12,16 +12,19 @@ from bot.action.mouse import MouseController
 from bot.capture import WindowCapture
 from bot.config import RuntimeConfig
 from bot.ocr_config import load_ocr_config
+from bot.ocr_runtime import DatasetOcr
 from bot.regions import load_deck_slots, load_hand_detection_config, load_regions
 from bot.sampler import SampleCollector
 from bot.strategy.rules import decide_action
 from bot.template_index import load_template_specs
 from bot.vision.board_state import (
     BoardState,
+    HandCard,
     build_hand_debug_entries,
     get_end_turn_active_score,
     parse_board_state,
 )
+from bot.vision.matcher import crop_region
 from bot.vision.scene import SceneDetection, detect_scene
 
 
@@ -37,6 +40,7 @@ class HearthstoneBot:
             config.templates_dir,
         )
         self.ocr_config = load_ocr_config(config.ocr_config_path)
+        self.dataset_ocr = DatasetOcr(config.asset_profile, self.ocr_config)
         self.sampler = SampleCollector(config)
         self.mouse = MouseController(self.capture)
         self.hotkeys = HotkeyController()
@@ -460,6 +464,7 @@ class HearthstoneBot:
                         end_turn_threshold=self.templates["end_turn"].threshold,
                         hand_config=self.hand_detection_config,
                     )
+                    board_state = self._apply_ocr_board_state(frame, board_state)
                     if (
                         not board_state.can_end_turn
                         and len(board_state.hand_cards) == 0
@@ -501,13 +506,16 @@ class HearthstoneBot:
                     elif any(card.playable for card in board_state.hand_cards):
                         self._battle_stall_count += 1
                     logger.info(
-                        "Battle state: detected_cards={}, end_turn_active_score={}, stall_count={}, playable_scores={}, attempted={}",
+                        "Battle state: detected_cards={}, mana={}/{}, end_turn_active_score={}, stall_count={}, playable_scores={}, attempted={}",
                         len(board_state.hand_cards),
+                        board_state.mana_current,
+                        board_state.mana_total,
                         round(board_state.end_turn_active_score, 3),
                         self._battle_stall_count,
                         [
                             {
                                 "id": card.card_id,
+                                "cost": card.mana_cost,
                                 "score": round(card.playable_score, 3),
                                 "playable": card.playable,
                             }
@@ -687,10 +695,11 @@ class HearthstoneBot:
                         drag_start = action.params["drag_start"]
                         self._last_play_attempt_card_id = str(action.params["card_id"])
                         logger.info(
-                            "Play card {} from {} with score={}",
+                            "Play card {} from {} with score={} cost={}",
                             self._last_play_attempt_card_id,
                             drag_start,
                             round(float(action.params["playable_score"]), 3),
+                            action.params.get("mana_cost"),
                         )
                         target = self._board_play_target()
                         logger.info("Drag target: {}", target)
@@ -827,20 +836,216 @@ class HearthstoneBot:
             return
         try:
             window = self.capture.find_window()
+            extra_crops = self._build_hand_cost_sample_crops(frame, board_state)
             self.sampler.collect_from_frame(
                 tag=self.config.ocr_auto_sample_tag,
                 frame=frame,
                 window=window,
                 include_regions=True,
-                region_names=["mana"],
+                region_names=["mana", "hand"],
                 metadata={
                     "scene": "battle_end_turn",
                     "can_end_turn": board_state.can_end_turn,
                     "end_turn_active_score": round(board_state.end_turn_active_score, 3),
                     "detected_cards": len(board_state.hand_cards),
                     "card_ids": ",".join(card.card_id for card in board_state.hand_cards),
+                    "cost_crop_count": len(extra_crops),
                 },
+                extra_crops=extra_crops,
             )
             self._last_ocr_sample_signature = signature
         except Exception as exc:
             logger.warning("OCR auto sample failed: {}", exc)
+
+    def _recognize_mana_text(self, frame: np.ndarray) -> tuple[int | None, int | None, float]:
+        mana_crop = crop_region(frame, self.regions["mana"])
+        label, confidence = self.dataset_ocr.recognize_mana(mana_crop)
+        if not label or "/" not in label:
+            return None, None, confidence
+        current_text, total_text = label.split("/", 1)
+        if not current_text.isdigit() or not total_text.isdigit():
+            return None, None, confidence
+        return int(current_text), int(total_text), confidence
+
+    def _build_ocr_hand_cards(self, frame: np.ndarray, mana_current: int | None) -> list[HandCard]:
+        hand_region = self.regions["hand"]
+        hand_frame = frame[
+            hand_region.y : hand_region.y + hand_region.h,
+            hand_region.x : hand_region.x + hand_region.w,
+        ]
+        if hand_frame.size == 0:
+            return []
+
+        cards: list[HandCard] = []
+        frame_height, frame_width = frame.shape[:2]
+        for center_x, center_y, radius in self._detect_hand_cost_gems(hand_frame):
+            global_x = hand_region.x + center_x
+            global_y = hand_region.y + center_y
+            x1 = max(0, int(global_x - (radius * 1.55)))
+            y1 = max(0, int(global_y - (radius * 1.35)))
+            x2 = min(frame_width, int(global_x + (radius * 1.55)))
+            y2 = min(frame_height, int(global_y + (radius * 1.35)))
+            if x2 <= x1 or y2 <= y1:
+                continue
+            crop = frame[y1:y2, x1:x2].copy()
+            if crop.size == 0 or not self._is_valid_cost_crop(crop):
+                continue
+
+            label, confidence = self.dataset_ocr.recognize_cost(crop)
+            if label is None or not label.isdigit():
+                continue
+            mana_cost = int(label)
+            cards.append(
+                HandCard(
+                    card_id=f"{global_x}:{global_y}",
+                    anchor_center=(global_x, global_y),
+                    drag_start=(global_x, min(self.config.window_height - 12, hand_region.y + hand_region.h - 8)),
+                    bbox=(x1, y1, x2 - x1, y2 - y1),
+                    playable_score=confidence,
+                    playable=(mana_current is not None and mana_cost <= mana_current),
+                    mana_cost=mana_cost,
+                    ocr_confidence=confidence,
+                )
+            )
+        cards.sort(key=lambda card: card.anchor_center[0])
+        return cards
+
+    def _apply_ocr_board_state(self, frame: np.ndarray, board_state: BoardState) -> BoardState:
+        mana_current, mana_total, mana_confidence = self._recognize_mana_text(frame)
+        ocr_hand_cards = self._build_ocr_hand_cards(frame, mana_current)
+
+        if mana_current is None or mana_total is None:
+            mana_current = board_state.mana_current
+            mana_total = board_state.mana_total
+            ocr_hand_cards = board_state.hand_cards
+        elif not ocr_hand_cards:
+            ocr_hand_cards = board_state.hand_cards
+
+        logger.debug(
+            "OCR state: mana={}/{} conf={} cards={}",
+            mana_current,
+            mana_total,
+            round(mana_confidence, 3),
+            [
+                {
+                    "id": card.card_id,
+                    "cost": card.mana_cost,
+                    "playable": card.playable,
+                    "conf": round(card.ocr_confidence, 3),
+                }
+                for card in ocr_hand_cards
+            ],
+        )
+        return BoardState(
+            my_turn=board_state.my_turn,
+            can_end_turn=board_state.can_end_turn,
+            end_turn_active_score=board_state.end_turn_active_score,
+            mana_current=int(mana_current),
+            mana_total=int(mana_total),
+            hand_cards=ocr_hand_cards,
+        )
+
+    def _build_hand_cost_sample_crops(
+        self,
+        frame: np.ndarray,
+        board_state: BoardState,
+    ) -> dict[str, np.ndarray]:
+        del board_state
+        crops: dict[str, np.ndarray] = {}
+        hand_region = self.regions["hand"]
+        hand_frame = frame[
+            hand_region.y : hand_region.y + hand_region.h,
+            hand_region.x : hand_region.x + hand_region.w,
+        ]
+        if hand_frame.size == 0:
+            return crops
+
+        gem_targets = self._detect_hand_cost_gems(hand_frame)
+        frame_height, frame_width = frame.shape[:2]
+        for index, (center_x, center_y, radius) in enumerate(gem_targets, start=1):
+            global_x = hand_region.x + center_x
+            global_y = hand_region.y + center_y
+            x1 = max(0, int(global_x - (radius * 1.55)))
+            y1 = max(0, int(global_y - (radius * 1.35)))
+            x2 = min(frame_width, int(global_x + (radius * 1.55)))
+            y2 = min(frame_height, int(global_y + (radius * 1.35)))
+            if x2 <= x1 or y2 <= y1:
+                continue
+            crop = frame[y1:y2, x1:x2].copy()
+            if crop.size == 0:
+                continue
+            if not self._is_valid_cost_crop(crop):
+                continue
+            safe_card_id = f"{global_x}_{global_y}"
+            crops[f"cost_card_{index:02d}_{safe_card_id}"] = crop
+        return crops
+
+    def _detect_hand_cost_gems(self, hand_frame: np.ndarray) -> list[tuple[int, int, int]]:
+        hsv = cv2.cvtColor(hand_frame, cv2.COLOR_BGR2HSV)
+        blue_mask = cv2.inRange(
+            hsv,
+            (90, 60, 60),
+            (130, 255, 255),
+        )
+        blurred_mask = cv2.GaussianBlur(blue_mask, (9, 9), 2)
+        circles = cv2.HoughCircles(
+            blurred_mask,
+            cv2.HOUGH_GRADIENT,
+            dp=1.2,
+            minDist=22,
+            param1=60,
+            param2=12,
+            minRadius=8,
+            maxRadius=18,
+        )
+        if circles is None:
+            return []
+
+        raw_circles = [
+            tuple(int(value) for value in circle)
+            for circle in np.round(circles[0]).astype(int)
+            if int(circle[1]) < min(55, hand_frame.shape[0] - 6)
+        ]
+        raw_circles.sort(key=lambda item: (item[0], item[1]))
+
+        deduped: list[tuple[int, int, int]] = []
+        for x, y, radius in raw_circles:
+            if deduped and abs(x - deduped[-1][0]) < 34:
+                if y < deduped[-1][1]:
+                    deduped[-1] = (x, y, radius)
+                continue
+            deduped.append((x, y, radius))
+        return deduped
+
+    def _is_valid_cost_crop(self, crop: np.ndarray) -> bool:
+        height, width = crop.shape[:2]
+        if width < 28 or height < 28:
+            return False
+        if width > 43 or height > 37:
+            return False
+
+        roi = crop[
+            int(height * 0.10) : int(height * 0.70),
+            int(width * 0.10) : int(width * 0.70),
+        ]
+        if roi.size == 0:
+            return False
+
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        hue, saturation, value = cv2.split(hsv)
+        blue_ratio = (
+            (hue >= 90)
+            & (hue <= 130)
+            & (saturation >= 70)
+            & (value >= 70)
+        ).mean()
+        white_ratio = (
+            (saturation <= 70)
+            & (value >= 150)
+        ).mean()
+        contrast = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY).std()
+        return bool(
+            blue_ratio >= 0.08
+            and white_ratio >= 0.05
+            and contrast >= 45.0
+        )

@@ -19,6 +19,8 @@ class HandCard:
     bbox: tuple[int, int, int, int]
     playable_score: float
     playable: bool
+    mana_cost: int | None = None
+    ocr_confidence: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -464,11 +466,8 @@ def _candidate_to_hand_card(
             scored_candidate.candidate.bbox[2],
             scored_candidate.candidate.bbox[3],
         ),
-        playable_score=scored_candidate.playable_score,
-        playable=(
-            scored_candidate.card_score >= config.card_threshold
-            and scored_candidate.playable_score >= config.playable_threshold
-        ),
+        playable_score=0.0,
+        playable=False,
     )
 
 

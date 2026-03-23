@@ -7,6 +7,8 @@ from tkinter import messagebox, ttk
 
 from PIL import Image, ImageTk
 
+from bot.config import BASE_DIR
+
 
 WINDOW_TITLE = "OCR 标注工具"
 CONTEXT_IMAGE_MAX_SIZE = (640, 320)
@@ -15,7 +17,7 @@ LABEL_MODE_TEXT: dict[str, dict[str, str]] = {
     "mana": {
         "crop_title": "法力裁图",
         "mode_text": "当前模式：full 界面当前法力值/总法力值标注",
-        "help_text": "填写完整法力文本，例如：3/3、0/2、9/10",
+        "help_text": "填写完整法力文本，例如：3/3、0/2、10/10",
         "image_max_size": (240, 140),
     },
     "cost": {
@@ -38,6 +40,7 @@ class OcrLabelerApp:
         self.rows = self._load_rows(csv_path)
         if not self.rows:
             raise RuntimeError(f"No rows found in {csv_path}")
+
         self.index = self._initial_index()
         self.crop_photo: ImageTk.PhotoImage | None = None
         self.context_photo: ImageTk.PhotoImage | None = None
@@ -58,6 +61,17 @@ class OcrLabelerApp:
         self._bind_keys()
         self._render_current()
 
+    @staticmethod
+    def _is_pending(row: dict[str, str]) -> bool:
+        return row.get("label_status", "").strip() not in {"done", "skip"}
+
+    @staticmethod
+    def _resolve_dataset_path(raw_path: str) -> Path:
+        path = Path(raw_path)
+        if path.is_absolute():
+            return path
+        return BASE_DIR / path
+
     def _load_rows(self, csv_path: Path) -> list[dict[str, str]]:
         with csv_path.open("r", encoding="utf-8-sig", newline="") as handle:
             return list(csv.DictReader(handle))
@@ -71,9 +85,15 @@ class OcrLabelerApp:
 
     def _initial_index(self) -> int:
         for idx, row in enumerate(self.rows):
-            if row.get("label_status", "pending") != "done":
+            if self._is_pending(row):
                 return idx
         return 0
+
+    def _find_next_pending_index(self, start: int) -> int | None:
+        for idx in range(start, len(self.rows)):
+            if self._is_pending(self.rows[idx]):
+                return idx
+        return None
 
     def _build_ui(self) -> None:
         frame = ttk.Frame(self.root, padding=12)
@@ -82,6 +102,7 @@ class OcrLabelerApp:
         ttk.Label(frame, textvariable=self.progress_var, font=("Microsoft YaHei UI", 11, "bold")).pack(anchor=tk.W)
         ttk.Label(frame, textvariable=self.mode_var).pack(anchor=tk.W, pady=(4, 0))
         ttk.Label(frame, textvariable=self.status_var).pack(anchor=tk.W, pady=(4, 0))
+
         path_wrap = 940 if self.label_mode == "mana" else 720
         ttk.Label(frame, textvariable=self.crop_path_var, wraplength=path_wrap).pack(anchor=tk.W, pady=(4, 0))
         if self.label_mode == "mana":
@@ -144,9 +165,9 @@ class OcrLabelerApp:
 
     def _render_current(self) -> None:
         row = self.rows[self.index]
-        crop_path = Path(row["image_path"])
-        full_path = Path(row["full_path"])
-        meta_path = Path(row["meta_path"])
+        crop_path = self._resolve_dataset_path(row["image_path"])
+        full_path = self._resolve_dataset_path(row["full_path"])
+        meta_path = self._resolve_dataset_path(row["meta_path"])
 
         self.progress_var.set(f"样本 {self.index + 1}/{len(self.rows)}")
         self.mode_var.set(LABEL_MODE_TEXT[self.label_mode]["mode_text"])
@@ -160,6 +181,7 @@ class OcrLabelerApp:
         image_max_size = LABEL_MODE_TEXT[self.label_mode]["image_max_size"]
         self.crop_photo = self._load_photo(crop_path, image_max_size)
         self.crop_image_label.configure(image=self.crop_photo)
+
         if self.context_image_label is not None:
             self.context_photo = self._load_photo(full_path, CONTEXT_IMAGE_MAX_SIZE)
             self.context_image_label.configure(image=self.context_photo)
@@ -176,14 +198,14 @@ class OcrLabelerApp:
 
     def save_and_next(self) -> None:
         self.save_only()
-        self.next_row()
+        self.next_pending_row()
 
     def skip_row(self) -> None:
         row = self.rows[self.index]
         row["label"] = self.label_var.get().strip()
         row["label_status"] = "skip"
         self._save_rows()
-        self.next_row()
+        self.next_pending_row()
 
     def prev_row(self) -> None:
         if self.index > 0:
@@ -196,6 +218,14 @@ class OcrLabelerApp:
             self._render_current()
             return
         messagebox.showinfo(WINDOW_TITLE, "已经是最后一张样本。")
+
+    def next_pending_row(self) -> None:
+        next_index = self._find_next_pending_index(self.index + 1)
+        if next_index is not None:
+            self.index = next_index
+            self._render_current()
+            return
+        messagebox.showinfo(WINDOW_TITLE, "已完成所有待标注样本。")
 
 
 def run_ocr_labeler(csv_path: Path, label_mode: str) -> int:

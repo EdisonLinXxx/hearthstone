@@ -42,13 +42,24 @@ def decide_action(
             if card.card_id not in attempted_cards and card.playable
         ]
         if available_cards:
-            chosen = max(available_cards, key=lambda card: (card.playable_score, card.anchor_center[0]))
+            if any(card.mana_cost is not None for card in available_cards):
+                chosen = min(
+                    available_cards,
+                    key=lambda card: (
+                        card.mana_cost if card.mana_cost is not None else 99,
+                        -card.ocr_confidence,
+                        card.anchor_center[0],
+                    ),
+                )
+            else:
+                return Action("wait")
             return Action(
                 "play_card",
                 params={
                     "card_id": chosen.card_id,
                     "drag_start": chosen.drag_start,
                     "playable_score": chosen.playable_score,
+                    "mana_cost": chosen.mana_cost,
                 },
             )
         if board_state.can_end_turn:

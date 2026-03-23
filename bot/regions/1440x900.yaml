@@ -63,10 +63,10 @@ regions:
     w: 90
     h: 60
   hand:
-    x: 260
-    y: 598
-    w: 944
-    h: 244
+    x: 398
+    y: 808
+    w: 576
+    h: 92
   result_overlay:
     x: 324
     y: 120
