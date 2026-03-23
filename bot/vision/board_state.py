@@ -16,6 +16,7 @@ class HandCard:
     card_id: str
     anchor_center: tuple[int, int]
     drag_start: tuple[int, int]
+    bbox: tuple[int, int, int, int]
     playable_score: float
     playable: bool
 
@@ -457,6 +458,12 @@ def _candidate_to_hand_card(
         card_id=f"{global_x}:{global_y}",
         anchor_center=(global_x, global_y),
         drag_start=drag_start,
+        bbox=(
+            hand_region.x + scored_candidate.candidate.bbox[0],
+            hand_region.y + scored_candidate.candidate.bbox[1],
+            scored_candidate.candidate.bbox[2],
+            scored_candidate.candidate.bbox[3],
+        ),
         playable_score=scored_candidate.playable_score,
         playable=(
             scored_candidate.card_score >= config.card_threshold

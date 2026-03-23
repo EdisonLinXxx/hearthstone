@@ -150,6 +150,7 @@ OCR 方向：
 - 自动采样可由启动参数控制：
   - `--ocr-auto-sample`
   - `--no-ocr-auto-sample`
+- 启动示例：`python -m bot.main --deck-index 1 --resolution 1440x900 --ocr-auto-sample`
 
 后续建议顺序：
 

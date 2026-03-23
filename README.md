@@ -36,6 +36,8 @@ pip install -r requirements.txt
 ```powershell
 python -m bot.main --deck-index 1 --resolution 1600x900
 python -m bot.main --deck-index 1 --resolution 1440x900
+python -m bot.main --deck-index 1 --resolution 1440x900 --ocr-auto-sample
+python -m bot.main --deck-index 1 --resolution 1440x900 --no-ocr-auto-sample
 ```
 
 采样工具：

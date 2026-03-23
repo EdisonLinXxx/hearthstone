@@ -43,6 +43,7 @@ class SampleCollector:
         include_regions: bool,
         region_names: list[str] | None = None,
         metadata: dict[str, object] | None = None,
+        extra_crops: dict[str, object] | None = None,
     ) -> list[Path]:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         output_dir = self._base_output_dir(tag)
@@ -62,6 +63,11 @@ class SampleCollector:
                 region_path = output_dir / f"{timestamp}_{name}.png"
                 self.capture.to_pil_image(region_frame).save(region_path)
                 saved_paths.append(region_path)
+
+        for name, crop in (extra_crops or {}).items():
+            crop_path = output_dir / f"{timestamp}_{name}.png"
+            self.capture.to_pil_image(crop).save(crop_path)
+            saved_paths.append(crop_path)
 
         metadata_lines = [
             f"tag={tag}",

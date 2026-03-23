@@ -176,8 +176,6 @@ class HearthstoneBot:
         )
 
     def _looks_like_match_error(self, detection: SceneDetection, now: float) -> bool:
-        if not self._has_active_queue_context(now):
-            return False
         if detection.scores.get("result_banner", 0.0) >= 0.35:
             return False
         if detection.scores.get("result_continue_text", 0.0) >= 0.35:
@@ -185,23 +183,56 @@ class HearthstoneBot:
         confirm_score = detection.scores.get("confirm", 0.0)
         back_button_score = detection.scores.get("back_button", 0.0)
         queue_play_score = detection.scores.get("queue_play_button", 0.0)
+        main_battle_score = detection.scores.get("main_battle_button", 0.0)
+        traditional_battle_score = detection.scores.get("traditional_battle_button", 0.0)
+        casual_mode_score = detection.scores.get("casual_mode_button", 0.0)
+        has_active_queue_context = self._has_active_queue_context(now)
         strong_confirm_match = confirm_score >= self.templates["confirm"].threshold
-        relaxed_queue_error_match = (
+        menu_like_context = (
+            back_button_score >= 0.80
+            and (
+                queue_play_score >= 0.10
+                or main_battle_score >= 0.60
+                or traditional_battle_score >= 0.60
+                or casual_mode_score >= 0.60
+            )
+        )
+        strong_menu_error_match = strong_confirm_match and menu_like_context
+        relaxed_menu_error_match = (
             confirm_score >= 0.14
             and back_button_score >= 0.85
-            and queue_play_score >= 0.12
+            and (
+                queue_play_score >= 0.12
+                or main_battle_score >= 0.65
+                or traditional_battle_score >= 0.65
+                or casual_mode_score >= 0.65
+            )
         )
-        return strong_confirm_match or relaxed_queue_error_match
+        return (has_active_queue_context and strong_confirm_match) or strong_menu_error_match or relaxed_menu_error_match
 
     def _match_error_reason(self, detection: SceneDetection) -> str:
         confirm_score = detection.scores.get("confirm", 0.0)
         back_button_score = detection.scores.get("back_button", 0.0)
         queue_play_score = detection.scores.get("queue_play_button", 0.0)
+        main_battle_score = detection.scores.get("main_battle_button", 0.0)
+        traditional_battle_score = detection.scores.get("traditional_battle_button", 0.0)
+        casual_mode_score = detection.scores.get("casual_mode_button", 0.0)
+        menu_like_context = (
+            back_button_score >= 0.80
+            and (
+                queue_play_score >= 0.10
+                or main_battle_score >= 0.60
+                or traditional_battle_score >= 0.60
+                or casual_mode_score >= 0.60
+            )
+        )
+        if confirm_score >= self.templates["confirm"].threshold and menu_like_context:
+            return "strong menu confirm"
         if confirm_score >= self.templates["confirm"].threshold:
-            return "strong confirm template"
-        if confirm_score >= 0.14 and back_button_score >= 0.85 and queue_play_score >= 0.12:
-            return "relaxed queue confirm"
-        return "queue context confirm dialog"
+            return "strong queue confirm"
+        if confirm_score >= 0.14 and back_button_score >= 0.85:
+            return "relaxed menu confirm"
+        return "confirm dialog in menu context"
 
     def _looks_like_result_confirm(self, detection: SceneDetection, now: float) -> bool:
         if detection.scores.get("confirm", 0.0) < self.templates["confirm"].threshold:
@@ -801,7 +832,7 @@ class HearthstoneBot:
                 frame=frame,
                 window=window,
                 include_regions=True,
-                region_names=["mana", "hand"],
+                region_names=["mana"],
                 metadata={
                     "scene": "battle_end_turn",
                     "can_end_turn": board_state.can_end_turn,
