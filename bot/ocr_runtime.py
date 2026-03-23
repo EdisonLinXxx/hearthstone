@@ -25,19 +25,32 @@ class DatasetOcr:
         self.dataset_dir = BOT_DIR / "datasets" / "ocr" / asset_profile
         self.mana_size = (120, 28)
         self.cost_size = (44, 36)
-        self.mana_samples = self._load_samples(self.dataset_dir / "mana_to_label.csv", self.mana_size)
-        self.cost_samples = self._load_samples(self.dataset_dir / "cost_to_label.csv", self.cost_size)
+        self.mana_samples = self._load_samples("mana", self.dataset_dir / "mana_to_label.csv", self.mana_size)
+        self.cost_samples = self._load_samples("cost", self.dataset_dir / "cost_to_label.csv", self.cost_size)
 
     def recognize_mana(self, image: np.ndarray) -> tuple[str | None, float]:
-        return self._match_label(image, self.mana_samples, self.mana_size)
+        return self._match_label("mana", image, self.mana_samples, self.mana_size)
 
     def recognize_cost(self, image: np.ndarray) -> tuple[str | None, float]:
-        return self._match_label(image, self.cost_samples, self.cost_size)
+        return self._match_label("cost", image, self.cost_samples, self.cost_size)
 
-    def _load_samples(self, csv_path: Path, output_size: tuple[int, int]) -> list[OcrTemplateSample]:
+    def _get_region_config(self, region_name: str) -> OcrRegionConfig | None:
+        config = self.ocr_config.get(region_name)
+        if config is not None:
+            return config
+        if region_name == "cost":
+            return self.ocr_config.get("mana")
+        return None
+
+    def _load_samples(
+        self,
+        region_name: str,
+        csv_path: Path,
+        output_size: tuple[int, int],
+    ) -> list[OcrTemplateSample]:
         if not csv_path.exists():
             return []
-        config = self.ocr_config.get("mana")
+        config = self._get_region_config(region_name)
         if config is None:
             return []
 
@@ -63,13 +76,14 @@ class DatasetOcr:
 
     def _match_label(
         self,
+        region_name: str,
         image: np.ndarray,
         samples: list[OcrTemplateSample],
         output_size: tuple[int, int],
     ) -> tuple[str | None, float]:
         if not samples:
             return None, 0.0
-        config = self.ocr_config.get("mana")
+        config = self._get_region_config(region_name)
         if config is None:
             return None, 0.0
 

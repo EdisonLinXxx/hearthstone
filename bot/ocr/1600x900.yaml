@@ -5,6 +5,13 @@ mana:
   invert: false
   whitelist: "0123456789/"
 
+cost:
+  scale: 3
+  grayscale: true
+  threshold: 160
+  invert: false
+  whitelist: "0123456789"
+
 my_hp:
   scale: 3
   grayscale: true
