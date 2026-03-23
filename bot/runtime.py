@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
 from time import monotonic
 
 import cv2
@@ -26,6 +27,26 @@ from bot.vision.board_state import (
 )
 from bot.vision.matcher import crop_region
 from bot.vision.scene import SceneDetection, detect_scene
+
+
+@dataclass(frozen=True)
+class GemValidationMetrics:
+    blue_ratio: float
+    white_ratio: float
+    circularity: float
+    fill_ratio: float
+    edge_density: float
+    score: float
+
+
+@dataclass(frozen=True)
+class GemCandidate:
+    center_x: int
+    center_y: int
+    radius: int
+    bbox: tuple[int, int, int, int]
+    metrics: GemValidationMetrics
+    source: str
 
 
 class HearthstoneBot:
@@ -892,30 +913,35 @@ class HearthstoneBot:
             return []
 
         cards: list[HandCard] = []
-        frame_height, frame_width = frame.shape[:2]
-        for center_x, center_y, radius in self._detect_hand_cost_gems(hand_frame):
-            global_x = hand_region.x + center_x
-            global_y = hand_region.y + center_y
-            x1 = max(0, int(global_x - (radius * 1.55)))
-            y1 = max(0, int(global_y - (radius * 1.35)))
-            x2 = min(frame_width, int(global_x + (radius * 1.55)))
-            y2 = min(frame_height, int(global_y + (radius * 1.35)))
-            if x2 <= x1 or y2 <= y1:
-                continue
-            crop = frame[y1:y2, x1:x2].copy()
-            if crop.size == 0 or not self._is_valid_cost_crop(crop):
+        validated_candidates = self._detect_hand_cost_gems(hand_frame)
+        for candidate in validated_candidates:
+            crop = self._extract_cost_crop(frame, hand_region, candidate)
+            if crop is None or crop.size == 0:
                 continue
 
             label, confidence = self.dataset_ocr.recognize_cost(crop)
             if label is None or not label.isdigit():
+                logger.debug(
+                    "OCR cost reject: center=({}, {}) source={} score={} label={} conf={}",
+                    candidate.center_x,
+                    candidate.center_y,
+                    candidate.source,
+                    round(candidate.metrics.score, 3),
+                    label,
+                    round(confidence, 3),
+                )
                 continue
+
+            global_x = hand_region.x + candidate.center_x
+            global_y = hand_region.y + candidate.center_y
+            bbox_x, bbox_y, bbox_w, bbox_h = candidate.bbox
             mana_cost = int(label)
             cards.append(
                 HandCard(
                     card_id=f"{global_x}:{global_y}",
                     anchor_center=(global_x, global_y),
                     drag_start=(global_x, min(self.config.window_height - 12, hand_region.y + hand_region.h - 8)),
-                    bbox=(x1, y1, x2 - x1, y2 - y1),
+                    bbox=(hand_region.x + bbox_x, hand_region.y + bbox_y, bbox_w, bbox_h),
                     playable_score=confidence,
                     playable=(mana_current is not None and mana_cost <= mana_current),
                     mana_cost=mana_cost,
@@ -997,91 +1023,267 @@ class HearthstoneBot:
             return crops
 
         gem_targets = self._detect_hand_cost_gems(hand_frame)
-        frame_height, frame_width = frame.shape[:2]
-        for index, (center_x, center_y, radius) in enumerate(gem_targets, start=1):
-            global_x = hand_region.x + center_x
-            global_y = hand_region.y + center_y
-            x1 = max(0, int(global_x - (radius * 1.55)))
-            y1 = max(0, int(global_y - (radius * 1.35)))
-            x2 = min(frame_width, int(global_x + (radius * 1.55)))
-            y2 = min(frame_height, int(global_y + (radius * 1.35)))
-            if x2 <= x1 or y2 <= y1:
+        for index, candidate in enumerate(gem_targets, start=1):
+            crop = self._extract_cost_crop(frame, hand_region, candidate)
+            if crop is None or crop.size == 0:
                 continue
-            crop = frame[y1:y2, x1:x2].copy()
-            if crop.size == 0:
-                continue
-            if not self._is_valid_cost_crop(crop):
-                continue
-            safe_card_id = f"{global_x}_{global_y}"
+            safe_card_id = f"{hand_region.x + candidate.center_x}_{hand_region.y + candidate.center_y}"
             crops[f"cost_card_{index:02d}_{safe_card_id}"] = crop
         return crops
 
-    def _detect_hand_cost_gems(self, hand_frame: np.ndarray) -> list[tuple[int, int, int]]:
+    def _detect_hand_cost_gems(self, hand_frame: np.ndarray) -> list[GemCandidate]:
+        candidates = self._generate_hand_cost_gem_candidates(hand_frame)
+        if not candidates:
+            return []
+        validated = self._validate_hand_cost_gem_candidates(hand_frame, candidates)
+        logger.debug(
+            "Gem detect: generated={} validated={} xs={} scores={}",
+            len(candidates),
+            len(validated),
+            [candidate.center_x for candidate in validated],
+            [round(candidate.metrics.score, 3) for candidate in validated],
+        )
+        return validated
+
+    def _generate_hand_cost_gem_candidates(self, hand_frame: np.ndarray) -> list[tuple[int, int, int, str]]:
         hsv = cv2.cvtColor(hand_frame, cv2.COLOR_BGR2HSV)
-        blue_mask = cv2.inRange(
-            hsv,
-            (90, 60, 60),
-            (130, 255, 255),
-        )
-        blurred_mask = cv2.GaussianBlur(blue_mask, (9, 9), 2)
+        blue_mask = cv2.inRange(hsv, (88, 45, 45), (132, 255, 255))
+        blue_mask = cv2.GaussianBlur(blue_mask, (7, 7), 1.5)
+
+        raw_candidates: list[tuple[int, int, int, str]] = []
         circles = cv2.HoughCircles(
-            blurred_mask,
+            blue_mask,
             cv2.HOUGH_GRADIENT,
-            dp=1.2,
-            minDist=22,
-            param1=60,
-            param2=12,
-            minRadius=8,
-            maxRadius=18,
+            dp=1.15,
+            minDist=16,
+            param1=55,
+            param2=8,
+            minRadius=7,
+            maxRadius=19,
         )
-        if circles is None:
+        if circles is not None:
+            for circle in np.round(circles[0]).astype(int):
+                x, y, radius = (int(circle[0]), int(circle[1]), int(circle[2]))
+                if self._is_reasonable_gem_position(hand_frame, x, y, radius):
+                    raw_candidates.append((x, y, radius, "hough"))
+
+        mask_binary = cv2.inRange(hsv, (88, 55, 55), (132, 255, 255))
+        contours, _ = cv2.findContours(mask_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area < 80 or area > 1400:
+                continue
+            (x, y), radius = cv2.minEnclosingCircle(contour)
+            x_i, y_i, radius_i = int(round(x)), int(round(y)), int(round(radius))
+            if not self._is_reasonable_gem_position(hand_frame, x_i, y_i, radius_i):
+                continue
+            raw_candidates.append((x_i, y_i, radius_i, "contour"))
+
+        raw_candidates.sort(key=lambda item: (item[0], item[1], item[2]))
+        deduped: list[tuple[int, int, int, str]] = []
+        for x, y, radius, source in raw_candidates:
+            if not deduped:
+                deduped.append((x, y, radius, source))
+                continue
+            prev_x, prev_y, prev_radius, prev_source = deduped[-1]
+            center_distance = ((x - prev_x) ** 2 + (y - prev_y) ** 2) ** 0.5
+            if center_distance <= max(radius, prev_radius, 10):
+                if y < prev_y or (y == prev_y and source == "hough" and prev_source != "hough"):
+                    deduped[-1] = (x, y, radius, source)
+                continue
+            deduped.append((x, y, radius, source))
+        return deduped
+
+    def _validate_hand_cost_gem_candidates(
+        self,
+        hand_frame: np.ndarray,
+        raw_candidates: list[tuple[int, int, int, str]],
+    ) -> list[GemCandidate]:
+        evaluated: list[GemCandidate] = []
+        for x, y, radius, source in raw_candidates:
+            metrics = self._measure_gem_candidate(hand_frame, x, y, radius)
+            if metrics is None:
+                continue
+            if metrics.score < 0.43:
+                continue
+            bbox = self._build_hand_local_cost_bbox(hand_frame, x, y, radius)
+            if bbox is None:
+                continue
+            evaluated.append(
+                GemCandidate(
+                    center_x=x,
+                    center_y=y,
+                    radius=radius,
+                    bbox=bbox,
+                    metrics=metrics,
+                    source=source,
+                )
+            )
+
+        if not evaluated:
             return []
 
-        raw_circles = [
-            tuple(int(value) for value in circle)
-            for circle in np.round(circles[0]).astype(int)
-            if int(circle[1]) < min(55, hand_frame.shape[0] - 6)
+        evaluated.sort(key=lambda item: item.center_x)
+        spacing_values = [
+            evaluated[index + 1].center_x - evaluated[index].center_x
+            for index in range(len(evaluated) - 1)
+            if 14 <= (evaluated[index + 1].center_x - evaluated[index].center_x) <= 120
         ]
-        raw_circles.sort(key=lambda item: (item[0], item[1]))
+        median_spacing = float(np.median(spacing_values)) if spacing_values else 0.0
 
-        deduped: list[tuple[int, int, int]] = []
-        for x, y, radius in raw_circles:
-            if deduped and abs(x - deduped[-1][0]) < 34:
-                if y < deduped[-1][1]:
-                    deduped[-1] = (x, y, radius)
+        filtered: list[GemCandidate] = []
+        for index, candidate in enumerate(evaluated):
+            nearest_gap = min(
+                [
+                    abs(candidate.center_x - other.center_x)
+                    for other_index, other in enumerate(evaluated)
+                    if other_index != index
+                ],
+                default=0,
+            )
+            if nearest_gap and nearest_gap < max(12, int(candidate.radius * 1.1)):
+                if filtered and abs(filtered[-1].center_x - candidate.center_x) < max(12, int(candidate.radius * 1.1)):
+                    if candidate.metrics.score > filtered[-1].metrics.score:
+                        filtered[-1] = candidate
+                    continue
+            if median_spacing > 0 and nearest_gap > median_spacing * 2.4 and candidate.metrics.score < 0.58:
+                logger.debug(
+                    "Gem reject by spacing: center=({}, {}) gap={} median_gap={} score={}",
+                    candidate.center_x,
+                    candidate.center_y,
+                    nearest_gap,
+                    round(median_spacing, 1),
+                    round(candidate.metrics.score, 3),
+                )
                 continue
-            deduped.append((x, y, radius))
-        return deduped
+            filtered.append(candidate)
+
+        return filtered
+
+    def _is_reasonable_gem_position(self, hand_frame: np.ndarray, center_x: int, center_y: int, radius: int) -> bool:
+        height, width = hand_frame.shape[:2]
+        if radius < 7 or radius > 19:
+            return False
+        if center_y >= min(58, height - 6):
+            return False
+        if center_y <= 4 or center_x <= 4 or center_x >= width - 4:
+            return False
+        return True
+
+    def _build_hand_local_cost_bbox(
+        self,
+        hand_frame: np.ndarray,
+        center_x: int,
+        center_y: int,
+        radius: int,
+    ) -> tuple[int, int, int, int] | None:
+        height, width = hand_frame.shape[:2]
+        x1 = max(0, int(center_x - (radius * 1.55)))
+        y1 = max(0, int(center_y - (radius * 1.35)))
+        x2 = min(width, int(center_x + (radius * 1.55)))
+        y2 = min(height, int(center_y + (radius * 1.35)))
+        if x2 <= x1 or y2 <= y1:
+            return None
+        if (x2 - x1) < 28 or (y2 - y1) < 28:
+            return None
+        if (x2 - x1) > 44 or (y2 - y1) > 38:
+            return None
+        return x1, y1, x2 - x1, y2 - y1
+
+    def _extract_cost_crop(
+        self,
+        frame: np.ndarray,
+        hand_region,
+        candidate: GemCandidate,
+    ) -> np.ndarray | None:
+        x, y, w, h = candidate.bbox
+        x1 = hand_region.x + x
+        y1 = hand_region.y + y
+        x2 = x1 + w
+        y2 = y1 + h
+        crop = frame[y1:y2, x1:x2].copy()
+        if crop.size == 0 or not self._is_valid_cost_crop(crop):
+            return None
+        return crop
+
+    def _measure_gem_candidate(
+        self,
+        hand_frame: np.ndarray,
+        center_x: int,
+        center_y: int,
+        radius: int,
+    ) -> GemValidationMetrics | None:
+        bbox = self._build_hand_local_cost_bbox(hand_frame, center_x, center_y, radius)
+        if bbox is None:
+            return None
+        x, y, w, h = bbox
+        roi = hand_frame[y : y + h, x : x + w]
+        if roi.size == 0:
+            return None
+
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        hue, saturation, value = cv2.split(hsv)
+        blue_mask = (hue >= 88) & (hue <= 132) & (saturation >= 60) & (value >= 55)
+        white_mask = (saturation <= 80) & (value >= 150)
+
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(gray, 50, 140) > 0
+        yy, xx = np.ogrid[:h, :w]
+        ellipse_mask = (((xx - (w / 2.0)) / max(1.0, w * 0.42)) ** 2 + ((yy - (h / 2.0)) / max(1.0, h * 0.42)) ** 2) <= 1.0
+        ring_mask = (((xx - (w / 2.0)) / max(1.0, w * 0.48)) ** 2 + ((yy - (h / 2.0)) / max(1.0, h * 0.48)) ** 2) <= 1.0
+        ring_mask &= ~((((xx - (w / 2.0)) / max(1.0, w * 0.30)) ** 2 + ((yy - (h / 2.0)) / max(1.0, h * 0.30)) ** 2) <= 1.0)
+
+        blue_ratio = float(blue_mask[ellipse_mask].mean()) if np.any(ellipse_mask) else 0.0
+        white_ratio = float(white_mask[ellipse_mask].mean()) if np.any(ellipse_mask) else 0.0
+        fill_ratio = float(blue_mask.mean())
+        edge_density = float(edges[ring_mask].mean()) if np.any(ring_mask) else 0.0
+
+        blue_u8 = (blue_mask.astype(np.uint8) * 255)
+        contours, _ = cv2.findContours(blue_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        circularity = 0.0
+        if contours:
+            contour = max(contours, key=cv2.contourArea)
+            area = float(cv2.contourArea(contour))
+            perimeter = float(cv2.arcLength(contour, True))
+            if perimeter > 1e-3:
+                circularity = float((4.0 * np.pi * area) / (perimeter * perimeter))
+
+        score = (
+            min(1.0, blue_ratio / 0.22) * 0.34
+            + min(1.0, white_ratio / 0.11) * 0.22
+            + min(1.0, circularity / 0.62) * 0.22
+            + min(1.0, edge_density / 0.18) * 0.12
+            + min(1.0, fill_ratio / 0.18) * 0.10
+        )
+        return GemValidationMetrics(
+            blue_ratio=blue_ratio,
+            white_ratio=white_ratio,
+            circularity=circularity,
+            fill_ratio=fill_ratio,
+            edge_density=edge_density,
+            score=float(score),
+        )
 
     def _is_valid_cost_crop(self, crop: np.ndarray) -> bool:
         height, width = crop.shape[:2]
         if width < 28 or height < 28:
             return False
-        if width > 43 or height > 37:
+        if width > 44 or height > 38:
             return False
 
-        roi = crop[
-            int(height * 0.10) : int(height * 0.70),
-            int(width * 0.10) : int(width * 0.70),
-        ]
-        if roi.size == 0:
+        metrics = self._measure_gem_candidate(
+            crop,
+            center_x=width // 2,
+            center_y=height // 2,
+            radius=max(8, min(width, height) // 3),
+        )
+        if metrics is None:
             return False
-
-        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-        hue, saturation, value = cv2.split(hsv)
-        blue_ratio = (
-            (hue >= 90)
-            & (hue <= 130)
-            & (saturation >= 70)
-            & (value >= 70)
-        ).mean()
-        white_ratio = (
-            (saturation <= 70)
-            & (value >= 150)
-        ).mean()
-        contrast = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY).std()
+        contrast = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY).std()
         return bool(
-            blue_ratio >= 0.08
-            and white_ratio >= 0.05
-            and contrast >= 45.0
+            metrics.blue_ratio >= 0.07
+            and metrics.white_ratio >= 0.04
+            and metrics.circularity >= 0.22
+            and metrics.score >= 0.42
+            and contrast >= 40.0
         )
