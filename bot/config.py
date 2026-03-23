@@ -52,6 +52,8 @@ class RuntimeConfig:
     stagnant_timeout_seconds: float = DEFAULT_STAGNANT_TIMEOUT_SECONDS
     post_play_end_turn_delay_seconds: float = 3.0
     end_turn_confirm_frames: int = 2
+    ocr_auto_sample_enabled: bool = True
+    ocr_auto_sample_tag: str = "ocr_auto_turn_end"
 
     @property
     def regions_path(self) -> Path:

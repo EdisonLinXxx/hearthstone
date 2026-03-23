@@ -25,6 +25,19 @@ def _build_runtime_parser() -> argparse.ArgumentParser:
         default="1600x900",
         help="Window client resolution and asset profile.",
     )
+    parser.add_argument(
+        "--ocr-auto-sample",
+        dest="ocr_auto_sample",
+        action="store_true",
+        default=None,
+        help="Enable automatic OCR sample capture before end turn.",
+    )
+    parser.add_argument(
+        "--no-ocr-auto-sample",
+        dest="ocr_auto_sample",
+        action="store_false",
+        help="Disable automatic OCR sample capture before end turn.",
+    )
     return parser
 
 
@@ -42,6 +55,11 @@ def parse_runtime_args(argv: list[str] | None = None) -> RuntimeConfig:
         window_width=window_width,
         window_height=window_height,
         asset_profile=args.resolution,
+        ocr_auto_sample_enabled=(
+            RuntimeConfig(deck_index=args.deck_index).ocr_auto_sample_enabled
+            if args.ocr_auto_sample is None
+            else bool(args.ocr_auto_sample)
+        ),
     )
 
 
@@ -57,5 +75,7 @@ def parse_args() -> RuntimeConfig:
             str(args.deck_index),
             "--resolution",
             args.resolution,
+            *(["--ocr-auto-sample"] if args.ocr_auto_sample is True else []),
+            *(["--no-ocr-auto-sample"] if args.ocr_auto_sample is False else []),
         ]
     )

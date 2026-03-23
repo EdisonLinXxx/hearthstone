@@ -13,6 +13,7 @@ from bot.capture import WindowCapture
 from bot.config import RuntimeConfig
 from bot.ocr_config import load_ocr_config
 from bot.regions import load_deck_slots, load_hand_detection_config, load_regions
+from bot.sampler import SampleCollector
 from bot.strategy.rules import decide_action
 from bot.template_index import load_template_specs
 from bot.vision.board_state import (
@@ -36,6 +37,7 @@ class HearthstoneBot:
             config.templates_dir,
         )
         self.ocr_config = load_ocr_config(config.ocr_config_path)
+        self.sampler = SampleCollector(config)
         self.mouse = MouseController(self.capture)
         self.hotkeys = HotkeyController()
         self._last_scene: str | None = None
@@ -58,6 +60,7 @@ class HearthstoneBot:
         self._last_progress_at = 0.0
         self._end_turn_ready_at = 0.0
         self._end_turn_confirm_count = 0
+        self._last_ocr_sample_signature: tuple[int, tuple[str, ...]] | None = None
 
     def _board_play_target(self) -> tuple[int, int]:
         return (
@@ -524,6 +527,7 @@ class HearthstoneBot:
                         self._battle_stall_count = 0
                         self._end_turn_ready_at = 0.0
                         self._end_turn_confirm_count = 0
+                        self._last_ocr_sample_signature = None
                     if detection.scene in {"main_menu", "battle_menu", "queue_page", "matching"}:
                         self._last_battle_seen_at = 0.0
                     if detection.scene not in {"queue_page", "matching", "match_error"}:
@@ -668,6 +672,8 @@ class HearthstoneBot:
                         time.sleep(0.8)
                 elif action.name == "end_turn":
                     logger.info("End turn.")
+                    if board_state is not None:
+                        self._collect_ocr_turn_end_sample(frame, board_state)
                     self._click_match(
                         detection,
                         "end_turn",
@@ -774,3 +780,36 @@ class HearthstoneBot:
             self._result_click_count += 1
         self._pending_traditional_battle = False
         self._queue_step = 1
+
+    def _collect_ocr_turn_end_sample(
+        self,
+        frame: np.ndarray,
+        board_state: BoardState,
+    ) -> None:
+        if not self.config.ocr_auto_sample_enabled:
+            return
+        signature = (
+            len(board_state.hand_cards),
+            tuple(card.card_id for card in board_state.hand_cards),
+        )
+        if signature == self._last_ocr_sample_signature:
+            return
+        try:
+            window = self.capture.find_window()
+            self.sampler.collect_from_frame(
+                tag=self.config.ocr_auto_sample_tag,
+                frame=frame,
+                window=window,
+                include_regions=True,
+                region_names=["mana", "hand"],
+                metadata={
+                    "scene": "battle_end_turn",
+                    "can_end_turn": board_state.can_end_turn,
+                    "end_turn_active_score": round(board_state.end_turn_active_score, 3),
+                    "detected_cards": len(board_state.hand_cards),
+                    "card_ids": ",".join(card.card_id for card in board_state.hand_cards),
+                },
+            )
+            self._last_ocr_sample_signature = signature
+        except Exception as exc:
+            logger.warning("OCR auto sample failed: {}", exc)

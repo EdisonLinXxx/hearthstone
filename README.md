@@ -202,3 +202,38 @@ F8
 - 战斗内识别稳定性
 - 结果页与异常弹窗识别干净度
 - 运行时兜底逻辑继续去复杂化
+## 12. 本轮补充优化
+
+战斗内手牌与出牌：
+
+- `bot/vision/board_state.py` 新增更保守的手牌候选过滤，不再只靠绿色高亮判断是否为手牌
+- 新增底部约束、左下角黑名单区域过滤，优先排除英雄框、技能区和装饰区误检
+- 新增 `card_score` 与 `playable_score` 双层门槛，先判断“像不像一张牌”，再判断“是否可出”
+- 拖拽起点改成卡牌下半部固定锚点，降低拖到空白区和假目标的概率
+- `bot/regions/1440x900.yaml` 已收紧 `hand` 区域和 `hand_detection` 阈值；`1600x900` 也补齐了兼容字段
+
+结束回合稳定性：
+
+- 出牌后新增结束回合冷却，当前默认 `3.0s`
+- 结束回合点击前要求连续多帧确认按钮可点，避免出牌动画、hover 和绳子特效导致的误点
+- 相关配置在 `bot/config.py`：`post_play_end_turn_delay_seconds`、`end_turn_confirm_frames`
+
+结果页误判修复：
+
+- `bot/runtime.py` 中的结果页归一化逻辑已收紧
+- 当 `back_button`、`queue_play_button`、`main_battle_button`、`traditional_battle_button` 分数更像菜单/排队页时，不再允许把 `unknown` 误升格为 `result_continue`
+- 返回 `main_menu` / `battle_menu` / `queue_page` / `matching` 时会清理最近战斗上下文，避免“刚打完一局”后的残留偏置
+
+OCR 数据积累：
+
+- 已内置自动 OCR 采样逻辑，在真正点击 `结束回合` 前自动保存一组样本
+- 当前自动保存 `full`、`mana`、`hand` 三类图片和一份 `meta.txt`
+- 默认输出到 `bot/samples/<profile>/ocr_auto_turn_end/`
+- 启动参数：
+  - 开启：`python -m bot.main --deck-index 1 --resolution 1440x900 --ocr-auto-sample`
+  - 关闭：`python -m bot.main --deck-index 1 --resolution 1440x900 --no-ocr-auto-sample`
+
+当前建议：
+
+- 短期继续以 `1440x900` 为主做 OCR 数据积累，不要一开始同时铺开多分辨率
+- 下一步优先恢复 mana / 手牌费用 OCR，用规则校验替代“看绿光判断能不能出牌”
