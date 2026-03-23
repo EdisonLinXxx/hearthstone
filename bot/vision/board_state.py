@@ -31,6 +31,8 @@ class BoardState:
     mana_current: int
     mana_total: int
     hand_cards: list[HandCard]
+    hand_source: str = "none"
+    hand_cards_ready: bool = False
 
 
 @dataclass(frozen=True)
@@ -535,21 +537,13 @@ def parse_board_state(
     end_turn_threshold: float,
     hand_config: HandDetectionConfig,
 ) -> BoardState:
-    del ocr_config
-    hand_region = regions["hand"]
-    hand_image = crop_region(frame, hand_region)
-    green_mask = _build_hand_green_mask(hand_image, hand_config)
-    raw_candidates = _collect_raw_hand_candidates(hand_image, green_mask, hand_config)
-    candidates = _dedupe_hand_candidates(raw_candidates, hand_config, hand_region.w)
-    scored_candidates = [
-        _score_playable_candidate(hand_image, candidate, hand_config)
-        for candidate in candidates
-    ]
-    hand_cards = [
-        _candidate_to_hand_card(hand_region, scored_candidate, hand_config)
-        for scored_candidate in scored_candidates
-    ]
+    """Parse only battle base state.
 
+    Final battle hand_cards must come from the OCR/cost detection pipeline in runtime,
+    not from the legacy green-highlight hand candidate path.
+    """
+    del ocr_config
+    del hand_config
     end_turn_score = detection.scores.get("end_turn", 0.0)
     active_score = _end_turn_active_score(frame, regions["end_turn"])
     can_end_turn = end_turn_score >= end_turn_threshold and active_score >= 0.018
@@ -559,5 +553,7 @@ def parse_board_state(
         end_turn_active_score=active_score,
         mana_current=0,
         mana_total=0,
-        hand_cards=hand_cards,
+        hand_cards=[],
+        hand_source="battle_base",
+        hand_cards_ready=False,
     )

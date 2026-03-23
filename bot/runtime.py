@@ -48,7 +48,7 @@ class HearthstoneBot:
         self._battle_logged = False
         self._queue_step = 0
         self._pending_traditional_battle = False
-        self._last_battle_signature: tuple[int, tuple[int, ...]] | None = None
+        self._last_battle_signature: tuple[object, ...] | None = None
         self._turn_action_count = 0
         self._attempted_cards_this_turn: set[str] = set()
         self._last_play_attempt_card_id: str | None = None
@@ -464,7 +464,16 @@ class HearthstoneBot:
                         end_turn_threshold=self.templates["end_turn"].threshold,
                         hand_config=self.hand_detection_config,
                     )
-                    board_state = self._apply_ocr_board_state(frame, board_state)
+                    hand_debug_entries = build_hand_debug_entries(
+                        frame,
+                        self.regions["hand"],
+                        self.hand_detection_config,
+                    )
+                    board_state = self._apply_ocr_board_state(
+                        frame,
+                        board_state,
+                        hand_debug_entries=hand_debug_entries,
+                    )
                     if (
                         not board_state.can_end_turn
                         and len(board_state.hand_cards) == 0
@@ -490,6 +499,8 @@ class HearthstoneBot:
                         time.sleep(self.config.poll_interval_seconds)
                         continue
                     signature = (
+                        board_state.hand_source,
+                        board_state.hand_cards_ready,
                         len(board_state.hand_cards),
                         tuple(card.card_id for card in board_state.hand_cards),
                     )
@@ -503,10 +514,12 @@ class HearthstoneBot:
                         self._attempted_cards_this_turn.add(self._last_play_attempt_card_id)
                         self._last_play_attempt_card_id = None
                         self._battle_stall_count += 1
-                    elif any(card.playable for card in board_state.hand_cards):
+                    elif board_state.hand_cards_ready and any(card.playable for card in board_state.hand_cards):
                         self._battle_stall_count += 1
                     logger.info(
-                        "Battle state: detected_cards={}, mana={}/{}, end_turn_active_score={}, stall_count={}, playable_scores={}, attempted={}",
+                        "Battle state: hand_source={} ready={} detected_cards={}, mana={}/{}, end_turn_active_score={}, stall_count={}, hand_cards={}, attempted={}",
+                        board_state.hand_source,
+                        board_state.hand_cards_ready,
                         len(board_state.hand_cards),
                         board_state.mana_current,
                         board_state.mana_total,
@@ -516,21 +529,14 @@ class HearthstoneBot:
                             {
                                 "id": card.card_id,
                                 "cost": card.mana_cost,
-                                "score": round(card.playable_score, 3),
+                                "ocr_conf": round(card.ocr_confidence, 3),
                                 "playable": card.playable,
                             }
                             for card in board_state.hand_cards
                         ],
                         sorted(self._attempted_cards_this_turn),
                     )
-                    logger.debug(
-                        "Battle hand detection: {}",
-                        build_hand_debug_entries(
-                            frame,
-                            self.regions["hand"],
-                            self.hand_detection_config,
-                        ),
-                    )
+                    logger.debug("Battle hand debug candidates: {}", hand_debug_entries)
                     if board_state.can_end_turn and now >= self._end_turn_ready_at:
                         self._end_turn_confirm_count += 1
                     else:
@@ -601,6 +607,7 @@ class HearthstoneBot:
                     detection.scene == "battle"
                     and board_state is not None
                     and board_state.can_end_turn
+                    and board_state.hand_cards_ready
                     and self._battle_stall_count >= 6
                 ):
                     logger.info("Battle stalled with playable candidates. Force end turn.")
@@ -688,17 +695,25 @@ class HearthstoneBot:
                     self._mark_progress(now)
                 elif action.name == "battle_wait":
                     if not self._battle_logged:
-                        logger.info("Battle scene reached. Battle automation is not implemented yet.")
+                        logger.info(
+                            "Battle wait. reason={} hand_source={} ready={} mana={}/{}, cards={}",
+                            action.params.get("reason"),
+                            board_state.hand_source if board_state is not None else None,
+                            board_state.hand_cards_ready if board_state is not None else None,
+                            board_state.mana_current if board_state is not None else None,
+                            board_state.mana_total if board_state is not None else None,
+                            len(board_state.hand_cards) if board_state is not None else None,
+                        )
                         self._battle_logged = True
                 elif action.name == "play_card":
                     if self._turn_action_count < self.config.max_actions_per_turn:
                         drag_start = action.params["drag_start"]
                         self._last_play_attempt_card_id = str(action.params["card_id"])
                         logger.info(
-                            "Play card {} from {} with score={} cost={}",
+                            "Play card {} from {} with ocr_conf={} cost={}",
                             self._last_play_attempt_card_id,
                             drag_start,
-                            round(float(action.params["playable_score"]), 3),
+                            round(float(action.params["ocr_confidence"]), 3),
                             action.params.get("mana_cost"),
                         )
                         target = self._board_play_target()
@@ -910,22 +925,41 @@ class HearthstoneBot:
         cards.sort(key=lambda card: card.anchor_center[0])
         return cards
 
-    def _apply_ocr_board_state(self, frame: np.ndarray, board_state: BoardState) -> BoardState:
+    def _apply_ocr_board_state(
+        self,
+        frame: np.ndarray,
+        board_state: BoardState,
+        hand_debug_entries: list[dict[str, object]] | None = None,
+    ) -> BoardState:
         mana_current, mana_total, mana_confidence = self._recognize_mana_text(frame)
         ocr_hand_cards = self._build_ocr_hand_cards(frame, mana_current)
+        hand_debug_entries = hand_debug_entries or []
+        debug_candidate_count = len(hand_debug_entries)
+
+        hand_cards_ready = False
+        hand_source = "ocr_pending"
+        final_mana_current = mana_current if mana_current is not None else board_state.mana_current
+        final_mana_total = mana_total if mana_total is not None else board_state.mana_total
 
         if mana_current is None or mana_total is None:
-            mana_current = board_state.mana_current
-            mana_total = board_state.mana_total
-            ocr_hand_cards = board_state.hand_cards
-        elif not ocr_hand_cards:
-            ocr_hand_cards = board_state.hand_cards
+            hand_source = "ocr_missing_mana"
+        elif ocr_hand_cards:
+            hand_cards_ready = True
+            hand_source = "ocr"
+        elif debug_candidate_count > 0:
+            hand_source = "ocr_missing_cost"
+        else:
+            hand_cards_ready = True
+            hand_source = "ocr_empty"
 
         logger.debug(
-            "OCR state: mana={}/{} conf={} cards={}",
-            mana_current,
-            mana_total,
+            "OCR state: mana={}/{} conf={} source={} ready={} debug_candidates={} cards={}",
+            final_mana_current,
+            final_mana_total,
             round(mana_confidence, 3),
+            hand_source,
+            hand_cards_ready,
+            debug_candidate_count,
             [
                 {
                     "id": card.card_id,
@@ -940,9 +974,11 @@ class HearthstoneBot:
             my_turn=board_state.my_turn,
             can_end_turn=board_state.can_end_turn,
             end_turn_active_score=board_state.end_turn_active_score,
-            mana_current=int(mana_current),
-            mana_total=int(mana_total),
-            hand_cards=ocr_hand_cards,
+            mana_current=int(final_mana_current),
+            mana_total=int(final_mana_total),
+            hand_cards=ocr_hand_cards if hand_cards_ready else [],
+            hand_source=hand_source,
+            hand_cards_ready=hand_cards_ready,
         )
 
     def _build_hand_cost_sample_crops(

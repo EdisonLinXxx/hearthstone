@@ -35,6 +35,8 @@ def decide_action(
     if scene == "battle":
         if board_state is None or not board_state.my_turn:
             return Action("wait")
+        if not board_state.hand_cards_ready:
+            return Action("battle_wait", params={"reason": f"hand_cards_not_ready:{board_state.hand_source}"})
         attempted_cards = attempted_cards or set()
         available_cards = [
             card
@@ -58,7 +60,7 @@ def decide_action(
                 params={
                     "card_id": chosen.card_id,
                     "drag_start": chosen.drag_start,
-                    "playable_score": chosen.playable_score,
+                    "ocr_confidence": chosen.ocr_confidence,
                     "mana_cost": chosen.mana_cost,
                 },
             )
