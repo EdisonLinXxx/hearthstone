@@ -86,6 +86,7 @@ class HearthstoneBot:
         self._end_turn_ready_at = 0.0
         self._end_turn_confirm_count = 0
         self._last_ocr_sample_signature: tuple[int, tuple[str, ...]] | None = None
+        self._last_trusted_mana_state: tuple[int, int, bool] | None = None
 
     def _board_play_target(self) -> tuple[int, int]:
         return (
@@ -538,9 +539,11 @@ class HearthstoneBot:
                     elif board_state.hand_cards_ready and any(card.playable for card in board_state.hand_cards):
                         self._battle_stall_count += 1
                     logger.info(
-                        "Battle state: hand_source={} ready={} detected_cards={}, mana={}/{}, end_turn_active_score={}, stall_count={}, hand_cards={}, attempted={}",
+                        "Battle state: hand_source={} ready={} trusted={} reject_reasons={} detected_cards={}, mana={}/{}, end_turn_active_score={}, stall_count={}, hand_cards={}, attempted={}",
                         board_state.hand_source,
                         board_state.hand_cards_ready,
+                        board_state.ocr_trusted,
+                        list(board_state.ocr_reject_reasons[:3]),
                         len(board_state.hand_cards),
                         board_state.mana_current,
                         board_state.mana_total,
@@ -594,6 +597,7 @@ class HearthstoneBot:
                         self._end_turn_ready_at = 0.0
                         self._end_turn_confirm_count = 0
                         self._last_ocr_sample_signature = None
+                        self._last_trusted_mana_state = None
                     if detection.scene in {"main_menu", "battle_menu", "queue_page", "matching"}:
                         self._last_battle_seen_at = 0.0
                     if detection.scene not in {"queue_page", "matching", "match_error"}:
@@ -893,63 +897,127 @@ class HearthstoneBot:
         except Exception as exc:
             logger.warning("OCR auto sample failed: {}", exc)
 
-    def _recognize_mana_text(self, frame: np.ndarray) -> tuple[int | None, int | None, float]:
+    def _validate_mana_values(
+        self,
+        mana_current: int,
+        mana_total: int,
+        can_end_turn: bool,
+    ) -> tuple[bool, tuple[str, ...]]:
+        reasons: list[str] = []
+        if mana_current < 0 or mana_current > 10:
+            reasons.append(f"mana_current_out_of_range:{mana_current}")
+        if mana_total < 0 or mana_total > 10:
+            reasons.append(f"mana_total_out_of_range:{mana_total}")
+        if mana_current > mana_total:
+            reasons.append(f"mana_current_gt_total:{mana_current}>{mana_total}")
+        if self._last_trusted_mana_state is not None:
+            prev_current, prev_total, prev_can_end_turn = self._last_trusted_mana_state
+            if prev_can_end_turn == can_end_turn:
+                if abs(mana_total - prev_total) > 1:
+                    reasons.append(f"mana_total_jump:{prev_total}->{mana_total}")
+                if abs(mana_current - prev_current) > 4:
+                    reasons.append(f"mana_current_jump:{prev_current}->{mana_current}")
+        return len(reasons) == 0, tuple(reasons)
+
+    def _recognize_mana_text(
+        self,
+        frame: np.ndarray,
+        can_end_turn: bool,
+    ) -> tuple[int | None, int | None, float, tuple[str, ...]]:
         mana_crop = crop_region(frame, self.regions["mana"])
-        label, confidence = self.dataset_ocr.recognize_mana(mana_crop)
-        if not label or "/" not in label:
-            return None, None, confidence
+        decision = self.dataset_ocr.recognize_mana(mana_crop)
+        reasons = list(decision.reasons)
+        label = decision.label
+        if not label:
+            return None, None, decision.confidence, tuple(reasons or ["mana_ocr_rejected"])
+        if "/" not in label:
+            return None, None, decision.confidence, tuple(reasons + [f"mana_format_invalid:{label}"])
         current_text, total_text = label.split("/", 1)
         if not current_text.isdigit() or not total_text.isdigit():
-            return None, None, confidence
-        return int(current_text), int(total_text), confidence
+            return None, None, decision.confidence, tuple(reasons + [f"mana_non_digit:{label}"])
+        mana_current = int(current_text)
+        mana_total = int(total_text)
+        trusted, validation_reasons = self._validate_mana_values(mana_current, mana_total, can_end_turn)
+        if not trusted:
+            return None, None, decision.confidence, tuple(reasons + list(validation_reasons))
+        self._last_trusted_mana_state = (mana_current, mana_total, can_end_turn)
+        return mana_current, mana_total, decision.confidence, tuple(reasons)
 
-    def _build_ocr_hand_cards(self, frame: np.ndarray, mana_current: int | None) -> list[HandCard]:
+    def _build_ocr_hand_cards(
+        self,
+        frame: np.ndarray,
+        mana_current: int | None,
+    ) -> tuple[list[HandCard], tuple[str, ...]]:
         hand_region = self.regions["hand"]
         hand_frame = frame[
             hand_region.y : hand_region.y + hand_region.h,
             hand_region.x : hand_region.x + hand_region.w,
         ]
         if hand_frame.size == 0:
-            return []
+            return [], ("hand_frame_empty",)
 
         cards: list[HandCard] = []
+        reject_reasons: list[str] = []
         validated_candidates = self._detect_hand_cost_gems(hand_frame)
         for candidate in validated_candidates:
             crop = self._extract_cost_crop(frame, hand_region, candidate)
             if crop is None or crop.size == 0:
+                reject_reasons.append(f"cost_crop_invalid:{candidate.center_x},{candidate.center_y}")
                 continue
 
-            label, confidence = self.dataset_ocr.recognize_cost(crop)
+            decision = self.dataset_ocr.recognize_cost(crop)
+            label = decision.label
             if label is None or not label.isdigit():
+                reason_text = ",".join(decision.reasons) if decision.reasons else "cost_ocr_rejected"
                 logger.debug(
-                    "OCR cost reject: center=({}, {}) source={} score={} label={} conf={}",
+                    "OCR cost reject: center=({}, {}) source={} score={} conf={} best_diff={} second_diff={} reasons={}"
+                    ,
                     candidate.center_x,
                     candidate.center_y,
                     candidate.source,
                     round(candidate.metrics.score, 3),
-                    label,
-                    round(confidence, 3),
+                    round(decision.confidence, 3),
+                    round(decision.best_diff, 4),
+                    round(decision.second_diff, 4),
+                    reason_text,
                 )
+                reject_reasons.append(f"cost_reject:{candidate.center_x},{candidate.center_y}:{reason_text}")
+                continue
+
+            mana_cost = int(label)
+            if mana_cost < 0 or mana_cost > 20:
+                reason_text = f"cost_out_of_range:{mana_cost}"
+                logger.debug(
+                    "OCR cost reject: center=({}, {}) source={} score={} conf={} label={} reasons={}"
+                    ,
+                    candidate.center_x,
+                    candidate.center_y,
+                    candidate.source,
+                    round(candidate.metrics.score, 3),
+                    round(decision.confidence, 3),
+                    label,
+                    reason_text,
+                )
+                reject_reasons.append(f"cost_reject:{candidate.center_x},{candidate.center_y}:{reason_text}")
                 continue
 
             global_x = hand_region.x + candidate.center_x
             global_y = hand_region.y + candidate.center_y
             bbox_x, bbox_y, bbox_w, bbox_h = candidate.bbox
-            mana_cost = int(label)
             cards.append(
                 HandCard(
                     card_id=f"{global_x}:{global_y}",
                     anchor_center=(global_x, global_y),
                     drag_start=(global_x, min(self.config.window_height - 12, hand_region.y + hand_region.h - 8)),
                     bbox=(hand_region.x + bbox_x, hand_region.y + bbox_y, bbox_w, bbox_h),
-                    playable_score=confidence,
+                    playable_score=decision.confidence,
                     playable=(mana_current is not None and mana_cost <= mana_current),
                     mana_cost=mana_cost,
-                    ocr_confidence=confidence,
+                    ocr_confidence=decision.confidence,
                 )
             )
         cards.sort(key=lambda card: card.anchor_center[0])
-        return cards
+        return cards, tuple(reject_reasons)
 
     def _apply_ocr_board_state(
         self,
@@ -957,34 +1025,48 @@ class HearthstoneBot:
         board_state: BoardState,
         hand_debug_entries: list[dict[str, object]] | None = None,
     ) -> BoardState:
-        mana_current, mana_total, mana_confidence = self._recognize_mana_text(frame)
-        ocr_hand_cards = self._build_ocr_hand_cards(frame, mana_current)
+        mana_current, mana_total, mana_confidence, mana_reasons = self._recognize_mana_text(
+            frame,
+            can_end_turn=board_state.can_end_turn,
+        )
+        ocr_hand_cards, cost_reasons = self._build_ocr_hand_cards(frame, mana_current)
         hand_debug_entries = hand_debug_entries or []
         debug_candidate_count = len(hand_debug_entries)
 
         hand_cards_ready = False
         hand_source = "ocr_pending"
+        ocr_trusted = False
+        reject_reasons = list(mana_reasons)
         final_mana_current = mana_current if mana_current is not None else board_state.mana_current
         final_mana_total = mana_total if mana_total is not None else board_state.mana_total
 
         if mana_current is None or mana_total is None:
             hand_source = "ocr_missing_mana"
+        elif cost_reasons and not ocr_hand_cards and debug_candidate_count > 0:
+            hand_source = "ocr_untrusted_cost"
+            reject_reasons.extend(cost_reasons)
         elif ocr_hand_cards:
             hand_cards_ready = True
             hand_source = "ocr"
+            ocr_trusted = True
         elif debug_candidate_count > 0:
             hand_source = "ocr_missing_cost"
+            reject_reasons.extend(cost_reasons)
         else:
             hand_cards_ready = True
             hand_source = "ocr_empty"
+            ocr_trusted = True
 
         logger.debug(
-            "OCR state: mana={}/{} conf={} source={} ready={} debug_candidates={} cards={}",
+            "OCR state: mana={}/{} conf={} trusted={} source={} ready={} mana_reasons={} cost_reasons={} debug_candidates={} cards={}",
             final_mana_current,
             final_mana_total,
             round(mana_confidence, 3),
+            ocr_trusted,
             hand_source,
             hand_cards_ready,
+            list(mana_reasons),
+            list(cost_reasons),
             debug_candidate_count,
             [
                 {
@@ -1005,6 +1087,8 @@ class HearthstoneBot:
             hand_cards=ocr_hand_cards if hand_cards_ready else [],
             hand_source=hand_source,
             hand_cards_ready=hand_cards_ready,
+            ocr_trusted=ocr_trusted,
+            ocr_reject_reasons=tuple(reject_reasons),
         )
 
     def _build_hand_cost_sample_crops(

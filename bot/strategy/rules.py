@@ -37,6 +37,9 @@ def decide_action(
             return Action("wait")
         if not board_state.hand_cards_ready:
             return Action("battle_wait", params={"reason": f"hand_cards_not_ready:{board_state.hand_source}"})
+        if not board_state.ocr_trusted:
+            reject_reason = ",".join(board_state.ocr_reject_reasons[:3]) if board_state.ocr_reject_reasons else board_state.hand_source
+            return Action("battle_wait", params={"reason": f"ocr_untrusted:{reject_reason}"})
         attempted_cards = attempted_cards or set()
         available_cards = [
             card

@@ -17,6 +17,16 @@ class OcrTemplateSample:
     image: np.ndarray
 
 
+@dataclass(frozen=True)
+class OcrDecision:
+    label: str | None
+    confidence: float
+    best_diff: float
+    second_diff: float
+    accepted: bool
+    reasons: tuple[str, ...] = ()
+
+
 class DatasetOcr:
     def __init__(self, asset_profile: str, ocr_config: dict[str, OcrRegionConfig]) -> None:
         self.asset_profile = asset_profile
@@ -27,11 +37,21 @@ class DatasetOcr:
         self.cost_size = (44, 36)
         self.mana_samples = self._load_samples("mana", self.dataset_dir / "mana_to_label.csv", self.mana_size)
         self.cost_samples = self._load_samples("cost", self.dataset_dir / "cost_to_label.csv", self.cost_size)
+        self.reject_thresholds: dict[str, dict[str, float]] = {
+            "mana": {
+                "max_best_diff": 0.34,
+                "min_margin": 0.015,
+            },
+            "cost": {
+                "max_best_diff": 0.36,
+                "min_margin": 0.012,
+            },
+        }
 
-    def recognize_mana(self, image: np.ndarray) -> tuple[str | None, float]:
+    def recognize_mana(self, image: np.ndarray) -> OcrDecision:
         return self._match_label("mana", image, self.mana_samples, self.mana_size)
 
-    def recognize_cost(self, image: np.ndarray) -> tuple[str | None, float]:
+    def recognize_cost(self, image: np.ndarray) -> OcrDecision:
         return self._match_label("cost", image, self.cost_samples, self.cost_size)
 
     def _get_region_config(self, region_name: str) -> OcrRegionConfig | None:
@@ -80,12 +100,26 @@ class DatasetOcr:
         image: np.ndarray,
         samples: list[OcrTemplateSample],
         output_size: tuple[int, int],
-    ) -> tuple[str | None, float]:
+    ) -> OcrDecision:
         if not samples:
-            return None, 0.0
+            return OcrDecision(
+                label=None,
+                confidence=0.0,
+                best_diff=1.0,
+                second_diff=1.0,
+                accepted=False,
+                reasons=("no_samples",),
+            )
         config = self._get_region_config(region_name)
         if config is None:
-            return None, 0.0
+            return OcrDecision(
+                label=None,
+                confidence=0.0,
+                best_diff=1.0,
+                second_diff=1.0,
+                accepted=False,
+                reasons=("missing_config",),
+            )
 
         processed = self._preprocess(image, config, output_size)
         ranked: list[tuple[float, str]] = []
@@ -96,10 +130,27 @@ class DatasetOcr:
 
         best_diff, best_label = ranked[0]
         second_diff = ranked[1][0] if len(ranked) > 1 else 1.0
+        margin = max(0.0, second_diff - best_diff)
         confidence = float(max(0.0, 1.0 - best_diff))
         if second_diff > best_diff:
-            confidence += float(min(0.25, (second_diff - best_diff) * 0.5))
-        return best_label, min(1.0, confidence)
+            confidence += float(min(0.25, margin * 0.5))
+
+        thresholds = self.reject_thresholds.get(region_name, {})
+        reasons: list[str] = []
+        if best_diff > thresholds.get("max_best_diff", 1.0):
+            reasons.append(f"best_diff_too_large:{best_diff:.4f}")
+        if margin < thresholds.get("min_margin", 0.0):
+            reasons.append(f"margin_too_small:{margin:.4f}")
+
+        accepted = len(reasons) == 0
+        return OcrDecision(
+            label=best_label if accepted else None,
+            confidence=min(1.0, confidence),
+            best_diff=float(best_diff),
+            second_diff=float(second_diff),
+            accepted=accepted,
+            reasons=tuple(reasons),
+        )
 
     def _resolve_dataset_path(self, raw_path: str) -> Path | None:
         value = raw_path.strip()

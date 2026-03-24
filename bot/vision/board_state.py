@@ -33,6 +33,8 @@ class BoardState:
     hand_cards: list[HandCard]
     hand_source: str = "none"
     hand_cards_ready: bool = False
+    ocr_trusted: bool = False
+    ocr_reject_reasons: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -556,4 +558,6 @@ def parse_board_state(
         hand_cards=[],
         hand_source="battle_base",
         hand_cards_ready=False,
+        ocr_trusted=False,
+        ocr_reject_reasons=(),
     )
