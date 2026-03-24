@@ -1,93 +1,123 @@
-# 炉石传说脚本
+﻿# 炉石传说脚本
 
 ## 1. 项目概况
 
-这是一个运行在 Windows 桌面环境下的炉石传说自动对战 Bot，当前采用：
+这是一个运行在 Windows 桌面前台环境中的炉石传说自动对战 Bot。
+当前目标不是复杂策略，而是先把“可稳定跑局”的识别与决策主链路收敛清楚。
 
+当前固定前提：
 - 前台截图
 - 前台输入
-- 固定分辨率 profile：`1600x900` / `1440x900`
-- 固定窗口化
 - 简体中文客户端
+- 固定分辨率 profile：`1600x900` / `1440x900`
+- 窗口位置固定：`(20, 20)`
 - 休闲模式
+- `deck_index=1-9`
 
-当前目标不是高胜率，而是稳定跑通完整闭环：
+## 2. 当前 battle 主链路
 
-- 进入游戏
-- 进入对战
-- 选择套牌
-- 开始匹配
-- 起手确认
-- 基础出牌
-- 结束回合
-- 处理结算
-- 回到队列继续
+当前 battle 阶段已经完成从“绿色高亮可出牌判断”到“OCR / 费用宝石 + 规则判定”的主链路切换。
 
-## 2. 启动方式
+### 职责边界
+- `bot/vision/board_state.py`
+  - `parse_board_state()` **只负责 battle 基础状态**
+  - 例如：是否我方回合、结束回合按钮是否可点、基础 battle 状态
+  - 不再负责最终 `hand_cards` 决策产出
+- `bot/runtime.py`
+  - 负责将 OCR mana / cost 识别结果组装成最终决策使用的 `hand_cards`
+  - 负责 OCR 可信度判定、规则校验、fallback 语义和运行时处置
+- `bot/strategy/rules.py`
+  - 只消费上游已经 finalized 的 `BoardState.hand_cards`
+  - 不重新解释 legacy 绿色候选，也不额外发明隐式 fallback
 
-依赖安装：
+### 当前最终手牌来源
+battle 决策中使用的最终 `hand_cards` **仅来自 OCR / 费用宝石链路**。
 
-```powershell
-pip install -r requirements.txt
-```
+旧的绿色高亮候选链路仍保留少量 debug 能力，但已经明确是：
+- debug-only
+- not used for decision
+- 不是正式 fallback
 
-主程序：
+## 3. 优先级 1-4 当前落实情况
 
-```powershell
-python -m bot.main --deck-index 1 --resolution 1600x900
-python -m bot.main --deck-index 1 --resolution 1440x900
-python -m bot.main --deck-index 1 --resolution 1440x900 --ocr-auto-sample
-python -m bot.main --deck-index 1 --resolution 1440x900 --no-ocr-auto-sample
-```
+### 优先级 1：统一手牌识别主链路
+**状态：已完成主体，并已收尾去歧义。**
 
-采样工具：
+已落实：
+- `parse_board_state()` 只返回 battle 基础状态
+- 最终 `hand_cards` 仅在 runtime 中由 OCR / cost gem 链路生成
+- `hand_source` / `hand_cards_ready` 已明确区分“可决策结果”和“等待 OCR”状态
+- legacy 绿色候选已明确标注为 debug-only
+- 日志已拆分“final cards”与“debug-only legacy candidates”，减少混链错觉
 
-```powershell
-python -m bot.sample_main --tag in_battle --deck-index 1 --resolution 1600x900
-python -m bot.sample_main --tag in_battle --deck-index 1 --resolution 1440x900
-```
+### 优先级 2：mana / cost 分离 OCR 预处理配置
+**状态：已完成。**
 
-停止方式：
+已落实：
+- `bot/ocr_runtime.py` 中 `recognize_mana()` / `recognize_cost()` 分别走各自配置
+- `bot/ocr/1440x900.yaml`、`bot/ocr/1600x900.yaml` 已有独立的 `mana:` / `cost:` 配置段
 
-```text
-F8
-```
+### 优先级 3：费用宝石检测改为“候选 + 验证”两阶段
+**状态：已完成第一版。**
 
-## 3. 当前固定约束
+已落实：
+- cost gem 检测已不再是简单候选即采信
+- runtime 中增加了候选验证指标，例如：
+  - 蓝色区域占比
+  - 白字区域占比
+  - 圆形结构/填充稳定性
+  - 边缘密度
+  - 综合分数
+- 目标是降低高密度手牌、特效干扰下的漏检与误检
 
-- 操作系统：Windows
-- 分辨率：`1600x900` / `1440x900`
-- 窗口位置：`(20, 20)`
-- 模式：窗口化
-- 游戏语言：简体中文
-- 目标模式：休闲模式
-- 套牌选择：`deck_index=1-9`
+### 优先级 4：OCR 拒识与规则校验机制
+**状态：已完成第一版。**
 
-不要默认支持：
+已落实：
+- `bot/ocr_runtime.py` 中为 mana / cost OCR 增加显式拒识机制：
+  - `best_diff` 过大拒识
+  - `best/second-best` 差距过小拒识
+- `bot/runtime.py` 中增加规则校验：
+  - `0 <= mana_current <= 10`
+  - `0 <= mana_total <= 10`
+  - `mana_current <= mana_total`
+  - `0 <= cost <= 20`
+- 增加轻量帧间跳变校验：
+  - `mana_total` 单帧异常大跳变拒绝
+  - `mana_current` 单帧异常大跳变拒绝
+- `BoardState` 已增加 OCR 可信状态表达
+- OCR 不可信时，策略层会等待，不会错误出牌
 
-- 动态分辨率
-- 后台截图
-- 后台输入
-- 中文卡名 OCR
+## 4. 当前已知限制与未完成项
 
-## 4. 关键文件
+以下仍是当前限制，不要在文档里假装已经完成：
+- `cost OCR` 仍是模板匹配，不是通用 OCR
+- `1440x900` 仍需要持续积累真实对局样本
+- OCR 拒识阈值和规则阈值目前仍偏经验值，需要继续实战调参
+- 攻击逻辑尚未实现
+- 不支持动态分辨率、后台截图、后台输入
+
+## 5. 关键文件
 
 核心运行：
-
 - `bot/runtime.py`
 - `bot/strategy/rules.py`
 - `bot/action/mouse.py`
 - `bot/action/hotkey.py`
 
 视觉识别：
-
 - `bot/vision/scene.py`
 - `bot/vision/board_state.py`
 - `bot/vision/matcher.py`
 
-配置资源：
+OCR：
+- `bot/ocr_runtime.py`
+- `bot/ocr_labeler_app.py`
+- `bot/ocr_label_main.py`
+- `bot/ocr_label_mana_main.py`
+- `bot/ocr_label_cost_main.py`
 
-- `bot/config.py`
+配置资源：
 - `bot/regions/1600x900.yaml`
 - `bot/regions/1440x900.yaml`
 - `bot/templates/1600x900/templates.yaml`
@@ -95,147 +125,35 @@ F8
 - `bot/ocr/1600x900.yaml`
 - `bot/ocr/1440x900.yaml`
 
-窗口与采样：
+## 6. 启动方式
 
-- `bot/capture.py`
-- `bot/sampler.py`
-- `bot/sample_main.py`
+安装依赖：
+```powershell
+pip install -r requirements.txt
+```
 
-## 5. 当前已实现能力
+主程序：
+```powershell
+python -m bot.main --deck-index 1 --resolution 1600x900
+python -m bot.main --deck-index 1 --resolution 1440x900
+python -m bot.main --deck-index 1 --resolution 1440x900 --ocr-auto-sample
+```
 
-- 能识别并归位炉石窗口
-- 能处理 `炉石传说` / `Hearthstone` 两种标题
-- 能走通主界面到对战流程
-- 能点击传统对战
-- 能选择 `deck_index=1-9`
-- 能点击开始匹配
-- 能处理匹配失败弹窗并点击中间确认
-- 能处理起手换牌确认
-- 能在对局内尝试基础出牌
-- 无牌可出时能结束回合
-- 能处理结果页、继续页、确认页
-- 能返回队列继续下一局
-- 能通过 `F8` 停止
-- 已支持 `1600x900` / `1440x900` 两套固定分辨率 profile
-- 已支持按 `--resolution` 选择 profile 对应的窗口尺寸、regions、templates、OCR 配置
-- 已加入画面停滞 watchdog 和业务停滞 watchdog，长时间无进展时会执行兜底点击
-- 已增加关键运行日志：场景分数、点击坐标、动作选择、拖拽目标、场景归一化原因
+标注工具：
+```powershell
+python -m bot.ocr_label_mana_main
+python -m bot.ocr_label_cost_main
+```
 
-## 6. 当前实现策略
+停止：
+```text
+F8
+```
 
-主要场景：
+## 7. 当前建议顺序
 
-- `startup`
-- `main_menu`
-- `battle_menu`
-- `queue_page`
-- `matching`
-- `match_error`
-- `mulligan`
-- `battle`
-- `result_continue`
-- `result`
-- `unknown`
-
-对局内当前不是费用驱动决策，而是近似规则：
-
-- 在手牌区检测高亮候选
-- 用分层手牌检测链路生成候选：绿色掩码 -> 原始候选 -> 宽连体拆峰值 -> 去重 -> 可出评分
-- 每次动作前重新计算候选
-- 同回合失败牌加入黑名单
-- 卡住后强制结束回合
-- `traditional_battle_button` 点击点使用匹配框下半部，避免点击到按钮上沿装饰
-- 不再对 `queue_play_button` / `end_turn` 使用固定像素偏移
-
-## 7. 本轮已完成优化
-
-手牌检测：
-
-- 将 `bot/vision/board_state.py` 重构为分层检测链路
-- 引入 `hand_detection` YAML 配置，按 profile 管理阈值
-- 去掉旧的“超宽连通域等宽切块”逻辑
-- 新增“宽连体高亮按横向峰值拆中心”
-- 新增自适应去重，减少密集手牌误合并
-- `1440x900` 已离线校准到：
-  - 样本一：人工 6 张亮绿，可检测 6 张
-  - 满手牌密集场景：已针对高密度排列收紧去重逻辑
-
-结果页与异常恢复：
-
-- `confirm` 不再在 `scene.py` 里直接等价于 `result`
-- 增加中性场景 `confirm_dialog`
-- 在 `runtime.py` 中统一归一化：
-  - `confirm_dialog -> match_error`
-  - `confirm_dialog -> result`
-  - `unknown/battle -> result_continue`
-  - `unknown -> battle`
-- 增加场景归一化原因日志，便于实机观察
-
-## 8. 当前已知薄弱点
-
-- 手牌候选识别仍可能有误检/漏检
-- `1440x900` 仍需要继续用实机样本校准
-- 结果页与异常弹窗虽然已收敛，但仍需实机验证边界
-- 目前没有真正费用 OCR
-- 没有攻击逻辑
-
-## 9. 修改代码时的注意事项
-
-- 不要重新引入针对特定分辨率的固定像素偏移
-- 每次点击或拖拽后保留鼠标停靠点逻辑，避免 hover 干扰
-- 不要重新引入 `match_count`
-- 如果改结果页或异常弹窗逻辑，优先减少误判，不要只靠模板阈值硬顶
-- 如果改对局逻辑，优先降低误检，再考虑复杂策略
-- `confirm_dialog` 的最终归类应放在 `runtime.py` 做，不要回退成静态硬编码 `confirm == result`
-
-## 10. 建议后续顺序
-
-1. 继续用实机样本验证并微调 `1440x900` 的 battle / result / matching / match_error
-2. 恢复数字 OCR，只做费用识别
-3. 增加更稳的出牌目标和攻击逻辑
-4. 最后再考虑更完整的战斗规则
-
-## 11. 交接结论
-
-这个工程当前已经能跑通一条基础自动化链路，但本质上仍是 MVP。
-
-后续优先把注意力放在：
-
-- 战斗内识别稳定性
-- 结果页与异常弹窗识别干净度
-- 运行时兜底逻辑继续去复杂化
-## 12. 本轮补充优化
-
-战斗内手牌与出牌：
-
-- `bot/vision/board_state.py` 新增更保守的手牌候选过滤，不再只靠绿色高亮判断是否为手牌
-- 新增底部约束、左下角黑名单区域过滤，优先排除英雄框、技能区和装饰区误检
-- 新增 `card_score` 与 `playable_score` 双层门槛，先判断“像不像一张牌”，再判断“是否可出”
-- 拖拽起点改成卡牌下半部固定锚点，降低拖到空白区和假目标的概率
-- `bot/regions/1440x900.yaml` 已收紧 `hand` 区域和 `hand_detection` 阈值；`1600x900` 也补齐了兼容字段
-
-结束回合稳定性：
-
-- 出牌后新增结束回合冷却，当前默认 `3.0s`
-- 结束回合点击前要求连续多帧确认按钮可点，避免出牌动画、hover 和绳子特效导致的误点
-- 相关配置在 `bot/config.py`：`post_play_end_turn_delay_seconds`、`end_turn_confirm_frames`
-
-结果页误判修复：
-
-- `bot/runtime.py` 中的结果页归一化逻辑已收紧
-- 当 `back_button`、`queue_play_button`、`main_battle_button`、`traditional_battle_button` 分数更像菜单/排队页时，不再允许把 `unknown` 误升格为 `result_continue`
-- 返回 `main_menu` / `battle_menu` / `queue_page` / `matching` 时会清理最近战斗上下文，避免“刚打完一局”后的残留偏置
-
-OCR 数据积累：
-
-- 已内置自动 OCR 采样逻辑，在真正点击 `结束回合` 前自动保存一组样本
-- 当前自动保存 `full`、`mana`、`hand` 三类图片和一份 `meta.txt`
-- 默认输出到 `bot/samples/<profile>/ocr_auto_turn_end/`
-- 启动参数：
-  - 开启：`python -m bot.main --deck-index 1 --resolution 1440x900 --ocr-auto-sample`
-  - 关闭：`python -m bot.main --deck-index 1 --resolution 1440x900 --no-ocr-auto-sample`
-
-当前建议：
-
-- 短期继续以 `1440x900` 为主做 OCR 数据积累，不要一开始同时铺开多分辨率
-- 下一步优先恢复 mana / 手牌费用 OCR，用规则校验替代“看绿光判断能不能出牌”
+1. 持续补充 `1440x900` 实战样本
+2. 持续补标 `mana_to_label.csv` / `cost_to_label.csv`
+3. 用实战日志验证 priority 4 的拒识和规则校验是否过松/过严
+4. 如有固定误识模式，再调整 OCR 预处理、拒识阈值或 gem 验证参数
+5. OCR 主链路稳定后，再推进攻击逻辑
