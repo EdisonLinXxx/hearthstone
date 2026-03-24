@@ -20,6 +20,7 @@ class OcrTemplateSample:
 @dataclass(frozen=True)
 class OcrDecision:
     label: str | None
+    raw_label: str | None
     confidence: float
     best_diff: float
     second_diff: float
@@ -40,7 +41,7 @@ class DatasetOcr:
         self.reject_thresholds: dict[str, dict[str, float]] = {
             "mana": {
                 "max_best_diff": 0.34,
-                "min_margin": 0.015,
+                "min_margin": 0.009,
             },
             "cost": {
                 "max_best_diff": 0.36,
@@ -104,6 +105,7 @@ class DatasetOcr:
         if not samples:
             return OcrDecision(
                 label=None,
+                raw_label=None,
                 confidence=0.0,
                 best_diff=1.0,
                 second_diff=1.0,
@@ -114,6 +116,7 @@ class DatasetOcr:
         if config is None:
             return OcrDecision(
                 label=None,
+                raw_label=None,
                 confidence=0.0,
                 best_diff=1.0,
                 second_diff=1.0,
@@ -145,6 +148,7 @@ class DatasetOcr:
         accepted = len(reasons) == 0
         return OcrDecision(
             label=best_label if accepted else None,
+            raw_label=best_label,
             confidence=min(1.0, confidence),
             best_diff=float(best_diff),
             second_diff=float(second_diff),

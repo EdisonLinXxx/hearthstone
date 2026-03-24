@@ -1070,7 +1070,7 @@ class HearthstoneBot:
         mana_crop = crop_region(frame, self.regions["mana"])
         decision = self.dataset_ocr.recognize_mana(mana_crop)
         reasons = list(decision.reasons)
-        label = decision.label
+        label = decision.label or decision.raw_label
         if not label:
             return None, None, decision.confidence, tuple(reasons or ["mana_ocr_rejected"])
         if "/" not in label:
@@ -1080,6 +1080,22 @@ class HearthstoneBot:
             return None, None, decision.confidence, tuple(reasons + [f"mana_non_digit:{label}"])
         mana_current = int(current_text)
         mana_total = int(total_text)
+
+        margin_only_reject = (
+            not decision.accepted
+            and bool(reasons)
+            and all(reason.startswith("margin_too_small:") for reason in reasons)
+        )
+        if margin_only_reject and self._last_trusted_mana_state is not None:
+            prev_current, prev_total, prev_can_end_turn = self._last_trusted_mana_state
+            if prev_can_end_turn == can_end_turn:
+                return (
+                    prev_current,
+                    prev_total,
+                    max(decision.confidence, 0.72),
+                    tuple(reasons + [f"mana_fallback_last_trusted:{prev_current}/{prev_total}"]),
+                )
+
         trusted, validation_reasons = self._validate_mana_values(mana_current, mana_total, can_end_turn)
         if not trusted:
             return None, None, decision.confidence, tuple(reasons + list(validation_reasons))
