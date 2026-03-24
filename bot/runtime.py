@@ -1124,13 +1124,12 @@ class HearthstoneBot:
                 reject_reasons.append(f"cost_crop_invalid:{candidate.center_x},{candidate.center_y}")
                 continue
 
-            decision = self.dataset_ocr.recognize_cost(crop)
+            decision = self._recognize_cost_from_crop(crop, candidate)
             label = decision.label
             if label is None or not label.isdigit():
                 reason_text = ",".join(decision.reasons) if decision.reasons else "cost_ocr_rejected"
                 logger.debug(
-                    "OCR cost reject: center=({}, {}) source={} score={} conf={} best_diff={} second_diff={} reasons={}"
-                    ,
+                    "OCR cost reject: center=({}, {}) source={} score={} conf={} best_diff={} second_diff={} reasons={}",
                     candidate.center_x,
                     candidate.center_y,
                     candidate.source,
@@ -1143,13 +1142,11 @@ class HearthstoneBot:
                 reject_reasons.append(f"cost_reject:{candidate.center_x},{candidate.center_y}:{reason_text}")
                 continue
 
-
             mana_cost = int(label)
             if mana_cost < 0 or mana_cost > 20:
                 reason_text = f"cost_out_of_range:{mana_cost}"
                 logger.debug(
-                    "OCR cost reject: center=({}, {}) source={} score={} conf={} label={} reasons={}"
-                    ,
+                    "OCR cost reject: center=({}, {}) source={} score={} conf={} label={} reasons={}",
                     candidate.center_x,
                     candidate.center_y,
                     candidate.source,
@@ -1178,6 +1175,70 @@ class HearthstoneBot:
             )
         cards.sort(key=lambda card: card.anchor_center[0])
         return cards, tuple(reject_reasons)
+
+    def _recognize_cost_from_crop(
+        self,
+        crop: np.ndarray,
+        candidate: GemCandidate,
+    ):
+        decision = self.dataset_ocr.recognize_cost(crop)
+        label = decision.label or decision.raw_label
+        if not label or not label.isdigit():
+            return decision
+
+        mana_cost = int(label)
+        margin = max(0.0, decision.second_diff - decision.best_diff)
+        margin_only_reject = (
+            not decision.accepted
+            and bool(decision.reasons)
+            and all(reason.startswith("margin_too_small:") for reason in decision.reasons)
+        )
+        if (
+            margin_only_reject
+            and mana_cost <= 7
+            and decision.best_diff <= 0.26
+            and (candidate.metrics.score >= 0.60 or candidate.metrics.white_ratio >= 0.04)
+        ):
+            return decision.__class__(
+                label=decision.raw_label,
+                raw_label=decision.raw_label,
+                confidence=max(decision.confidence, 0.74),
+                best_diff=decision.best_diff,
+                second_diff=decision.second_diff,
+                accepted=True,
+                reasons=tuple(decision.reasons) + (f"cost_margin_fallback:{mana_cost}",),
+            )
+
+        suspicious_high_cost = (
+            mana_cost >= 8
+            and (
+                (
+                    decision.best_diff >= 0.14
+                    and margin <= 0.055
+                    and (
+                        candidate.metrics.white_ratio < 0.18
+                        or candidate.metrics.circularity < 0.30
+                        or candidate.metrics.score < 0.72
+                    )
+                )
+                or (
+                    decision.best_diff >= 0.10
+                    and candidate.metrics.white_ratio < 0.10
+                    and candidate.metrics.circularity < 0.28
+                )
+            )
+        )
+        if suspicious_high_cost:
+            return decision.__class__(
+                label=None,
+                raw_label=decision.raw_label,
+                confidence=decision.confidence,
+                best_diff=decision.best_diff,
+                second_diff=decision.second_diff,
+                accepted=False,
+                reasons=tuple(decision.reasons) + (f"suspicious_high_cost_bias:{mana_cost}",),
+            )
+        return decision
 
     def _apply_ocr_board_state(
         self,
@@ -1428,15 +1489,15 @@ class HearthstoneBot:
         radius: int,
     ) -> tuple[int, int, int, int] | None:
         height, width = hand_frame.shape[:2]
-        x1 = max(0, int(center_x - (radius * 1.55)))
-        y1 = max(0, int(center_y - (radius * 1.35)))
-        x2 = min(width, int(center_x + (radius * 1.55)))
-        y2 = min(height, int(center_y + (radius * 1.35)))
+        x1 = max(0, int(center_x - (radius * 1.65)))
+        y1 = max(0, int(center_y - (radius * 1.45)))
+        x2 = min(width, int(center_x + (radius * 1.60)))
+        y2 = min(height, int(center_y + (radius * 1.50)))
         if x2 <= x1 or y2 <= y1:
             return None
         if (x2 - x1) < 28 or (y2 - y1) < 28:
             return None
-        if (x2 - x1) > 44 or (y2 - y1) > 38:
+        if (x2 - x1) > 52 or (y2 - y1) > 42:
             return None
         return x1, y1, x2 - x1, y2 - y1
 
@@ -1446,15 +1507,42 @@ class HearthstoneBot:
         hand_region,
         candidate: GemCandidate,
     ) -> np.ndarray | None:
-        x, y, w, h = candidate.bbox
-        x1 = hand_region.x + x
-        y1 = hand_region.y + y
-        x2 = x1 + w
-        y2 = y1 + h
-        crop = frame[y1:y2, x1:x2].copy()
-        if crop.size == 0 or not self._is_valid_cost_crop(crop):
+        hand_frame = frame[
+            hand_region.y : hand_region.y + hand_region.h,
+            hand_region.x : hand_region.x + hand_region.w,
+        ]
+        if hand_frame.size == 0:
             return None
-        return crop
+
+        best_crop: np.ndarray | None = None
+        best_score = -1.0
+        variant_specs = (
+            (0, 0, 1.00),
+            (-2, 0, 1.05),
+            (2, 0, 1.05),
+            (0, -2, 1.10),
+            (0, 2, 1.10),
+            (-2, -2, 1.15),
+            (2, -2, 1.15),
+        )
+        for shift_x, shift_y, scale in variant_specs:
+            bbox = self._build_hand_local_cost_bbox(
+                hand_frame,
+                candidate.center_x + shift_x,
+                candidate.center_y + shift_y,
+                max(7, int(round(candidate.radius * scale))),
+            )
+            if bbox is None:
+                continue
+            x, y, w, h = bbox
+            crop = hand_frame[y : y + h, x : x + w].copy()
+            crop_score = self._score_cost_crop(crop, candidate)
+            if crop_score < 0.40:
+                continue
+            if crop_score > best_score:
+                best_score = crop_score
+                best_crop = crop
+        return best_crop
 
     def _measure_gem_candidate(
         self,
@@ -1514,26 +1602,56 @@ class HearthstoneBot:
             score=float(score),
         )
 
+    def _score_cost_crop(
+        self,
+        crop: np.ndarray,
+        candidate: GemCandidate,
+    ) -> float:
+        height, width = crop.shape[:2]
+        if width < 28 or height < 28:
+            return 0.0
+        if width > 52 or height > 42:
+            return 0.0
+
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        contrast = float(gray.std())
+        if contrast < 28.0:
+            return 0.0
+
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        blue_mask = cv2.inRange(hsv, (88, 45, 45), (132, 255, 255)) > 0
+        white_mask = ((hsv[:, :, 1] <= 105) & (hsv[:, :, 2] >= 138))
+        digit_mask = gray >= 135
+
+        center_y1 = max(0, int(height * 0.18))
+        center_y2 = min(height, int(height * 0.82))
+        center_x1 = max(0, int(width * 0.18))
+        center_x2 = min(width, int(width * 0.82))
+        center_digit_ratio = float(digit_mask[center_y1:center_y2, center_x1:center_x2].mean()) if center_y2 > center_y1 and center_x2 > center_x1 else 0.0
+        blue_ratio = float(blue_mask.mean())
+        white_ratio = float(white_mask.mean())
+
+        return float(
+            min(1.0, candidate.metrics.score / 0.70) * 0.42
+            + min(1.0, contrast / 58.0) * 0.18
+            + min(1.0, blue_ratio / 0.18) * 0.18
+            + min(1.0, white_ratio / 0.11) * 0.10
+            + min(1.0, center_digit_ratio / 0.16) * 0.12
+        )
+
     def _is_valid_cost_crop(self, crop: np.ndarray) -> bool:
         height, width = crop.shape[:2]
         if width < 28 or height < 28:
             return False
-        if width > 44 or height > 38:
+        if width > 52 or height > 42:
             return False
 
-        metrics = self._measure_gem_candidate(
-            crop,
-            center_x=width // 2,
-            center_y=height // 2,
-            radius=max(8, min(width, height) // 3),
-        )
-        if metrics is None:
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        contrast = float(gray.std())
+        if contrast < 28.0:
             return False
-        contrast = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY).std()
-        return bool(
-            metrics.blue_ratio >= 0.07
-            and metrics.white_ratio >= 0.04
-            and metrics.circularity >= 0.22
-            and metrics.score >= 0.42
-            and contrast >= 40.0
-        )
+
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        blue_ratio = float((cv2.inRange(hsv, (88, 45, 45), (132, 255, 255)) > 0).mean())
+        white_ratio = float((((hsv[:, :, 1] <= 105) & (hsv[:, :, 2] >= 138))).mean())
+        return blue_ratio >= 0.04 and white_ratio >= 0.01
