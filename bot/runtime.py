@@ -881,6 +881,7 @@ class HearthstoneBot:
         *,
         sample_id: str,
         trigger_reason: str,
+        all_trigger_reasons: tuple[str, ...],
         scene: str,
         board_state: BoardState,
         hand_debug_entries: list[dict[str, object]] | None = None,
@@ -888,10 +889,9 @@ class HearthstoneBot:
         hand_debug_entries = hand_debug_entries or []
         return {
             "sample_id": sample_id,
-            "timestamp": datetime.now().isoformat(timespec="milliseconds"),
             "resolution": f"{self.config.window_width}x{self.config.window_height}",
-            "profile": self.config.asset_profile,
             "scene": scene,
+            "sample_kind": "ocr_anomaly",
             "hand_source": board_state.hand_source,
             "hand_cards_ready": board_state.hand_cards_ready,
             "ocr_trusted": board_state.ocr_trusted,
@@ -901,33 +901,40 @@ class HearthstoneBot:
             "final_cards_count": len(board_state.hand_cards),
             "debug_candidate_count": len(hand_debug_entries),
             "trigger_reason": trigger_reason,
+            "all_trigger_reasons": list(all_trigger_reasons),
         }
 
-    def _detect_battle_anomaly_trigger(
+    def _detect_battle_anomaly_triggers(
         self,
         board_state: BoardState,
         hand_debug_entries: list[dict[str, object]] | None = None,
-    ) -> str | None:
+    ) -> tuple[str, ...]:
         hand_debug_entries = hand_debug_entries or []
         reject_reasons = tuple(board_state.ocr_reject_reasons)
         reason_text = "|".join(reject_reasons)
+        triggers: list[str] = []
 
         if board_state.hand_source == "ocr_wait_mana":
             if any("jump:" in reason or "_out_of_range:" in reason or "_gt_total:" in reason for reason in reject_reasons):
-                return "mana_validation_failed"
+                triggers.append("mana_validation_failed")
             if reject_reasons:
-                return "ocr_wait_mana"
+                triggers.append("ocr_wait_mana")
         if board_state.hand_source == "ocr_wait_cost":
-            return "ocr_wait_cost"
+            triggers.append("ocr_wait_cost")
         if not board_state.hand_cards_ready:
-            return f"hand_cards_not_ready:{board_state.hand_source}"
+            triggers.append(f"hand_cards_not_ready:{board_state.hand_source}")
         if not board_state.ocr_trusted:
-            return "ocr_untrusted"
+            triggers.append("ocr_untrusted")
         if len(hand_debug_entries) > 0 and len(board_state.hand_cards) == 0:
-            return "legacy_candidates_without_final_cards"
+            triggers.append("legacy_candidates_without_final_cards")
         if "cost_reject:" in reason_text:
-            return "cost_ocr_untrusted"
-        return None
+            triggers.append("cost_ocr_untrusted")
+
+        deduped: list[str] = []
+        for trigger in triggers:
+            if trigger not in deduped:
+                deduped.append(trigger)
+        return tuple(deduped)
 
     def _collect_battle_anomaly_sample(
         self,
@@ -940,9 +947,10 @@ class HearthstoneBot:
     ) -> None:
         if not self.config.ocr_anomaly_sample_enabled:
             return
-        trigger_reason = self._detect_battle_anomaly_trigger(board_state, hand_debug_entries)
-        if trigger_reason is None:
+        all_trigger_reasons = self._detect_battle_anomaly_triggers(board_state, hand_debug_entries)
+        if not all_trigger_reasons:
             return
+        trigger_reason = all_trigger_reasons[0]
 
         debug_candidate_count = len(hand_debug_entries or [])
         signature = (
@@ -962,6 +970,7 @@ class HearthstoneBot:
             metadata = self._build_battle_sample_metadata(
                 sample_id=sample_id,
                 trigger_reason=trigger_reason,
+                all_trigger_reasons=all_trigger_reasons,
                 scene=scene,
                 board_state=board_state,
                 hand_debug_entries=hand_debug_entries,
@@ -979,9 +988,10 @@ class HearthstoneBot:
             self._last_anomaly_sample_signature = signature
             self._last_anomaly_sample_at = now
             logger.warning(
-                "Captured OCR anomaly sample. sample_id={} trigger_reason={} source={} ready={} trusted={} final_cards={} debug_candidates={} mana={}/{}",
+                "Captured OCR anomaly sample. sample_id={} trigger_reason={} all_trigger_reasons={} source={} ready={} trusted={} final_cards={} debug_candidates={} mana={}/{}",
                 sample_id,
                 trigger_reason,
+                list(all_trigger_reasons),
                 board_state.hand_source,
                 board_state.hand_cards_ready,
                 board_state.ocr_trusted,
@@ -1017,6 +1027,7 @@ class HearthstoneBot:
                 region_names=["mana", "hand"],
                 metadata={
                     "scene": "battle_end_turn",
+                    "sample_kind": "ocr_auto_turn_end",
                     "can_end_turn": board_state.can_end_turn,
                     "end_turn_active_score": round(board_state.end_turn_active_score, 3),
                     "detected_cards": len(board_state.hand_cards),
@@ -1115,6 +1126,7 @@ class HearthstoneBot:
                 )
                 reject_reasons.append(f"cost_reject:{candidate.center_x},{candidate.center_y}:{reason_text}")
                 continue
+
 
             mana_cost = int(label)
             if mana_cost < 0 or mana_cost > 20:

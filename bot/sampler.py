@@ -24,6 +24,57 @@ class SampleCollector:
         output_dir.mkdir(parents=True, exist_ok=True)
         return output_dir
 
+    @staticmethod
+    def _normalize_timestamp(value: object, *, fallback: str) -> str:
+        if isinstance(value, datetime):
+            return value.isoformat(timespec="milliseconds")
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return fallback
+            if "T" in stripped:
+                return stripped
+            try:
+                parsed = datetime.strptime(stripped, "%Y%m%d_%H%M%S_%f")
+                return parsed.isoformat(timespec="milliseconds")
+            except ValueError:
+                return stripped
+        return fallback
+
+    def _build_metadata_payload(
+        self,
+        *,
+        sample_id: str,
+        tag: str,
+        window: WindowInfo,
+        metadata: dict[str, object] | None,
+    ) -> dict[str, object]:
+        captured_at = datetime.now().isoformat(timespec="milliseconds")
+        metadata_payload: dict[str, object] = {
+            "sample_id": sample_id,
+            "timestamp": captured_at,
+            "captured_at": captured_at,
+            "timestamp_compact": sample_id,
+            "tag": tag,
+            "profile": self.config.asset_profile,
+            "window": {
+                "title": window.title,
+                "left": window.left,
+                "top": window.top,
+                "width": window.width,
+                "height": window.height,
+            },
+        }
+        metadata_payload.update(metadata or {})
+        normalized_timestamp = self._normalize_timestamp(
+            metadata_payload.get("captured_at") or metadata_payload.get("timestamp"),
+            fallback=captured_at,
+        )
+        metadata_payload["timestamp"] = normalized_timestamp
+        metadata_payload["captured_at"] = normalized_timestamp
+        metadata_payload.setdefault("timestamp_compact", sample_id)
+        return metadata_payload
+
     def collect(self, tag: str, include_regions: bool) -> list[Path]:
         self.capture.move_window()
         window = self.capture.find_window()
@@ -72,20 +123,12 @@ class SampleCollector:
             self.capture.to_pil_image(crop).save(crop_path)
             saved_paths.append(crop_path)
 
-        metadata_payload: dict[str, object] = {
-            "sample_id": sample_id,
-            "timestamp": timestamp,
-            "tag": tag,
-            "window": {
-                "title": window.title,
-                "left": window.left,
-                "top": window.top,
-                "width": window.width,
-                "height": window.height,
-            },
-            "profile": self.config.asset_profile,
-        }
-        metadata_payload.update(metadata or {})
+        metadata_payload = self._build_metadata_payload(
+            sample_id=sample_id,
+            tag=tag,
+            window=window,
+            metadata=metadata,
+        )
 
         metadata_lines = [
             f"sample_id={sample_id}",
