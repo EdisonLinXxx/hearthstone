@@ -86,6 +86,9 @@ class HearthstoneBot:
         self._last_progress_at = 0.0
         self._end_turn_ready_at = 0.0
         self._end_turn_confirm_count = 0
+        self._post_play_observe_until = 0.0
+        self._last_playable_seen_at = 0.0
+        self._previous_playable_snapshot: tuple[tuple[int, int, float], ...] = ()
         self._last_ocr_sample_signature: tuple[int, tuple[str, ...]] | None = None
         self._last_trusted_mana_state: tuple[int, int, bool] | None = None
         self._last_anomaly_sample_signature: tuple[str, str, int, int] | None = None
@@ -135,6 +138,98 @@ class HearthstoneBot:
 
     def _mark_progress(self, now: float) -> None:
         self._last_progress_at = now
+
+    def _build_playable_snapshot(self, board_state: BoardState | None) -> tuple[tuple[int, int, float], ...]:
+        if board_state is None or not board_state.hand_cards_ready:
+            return ()
+        snapshot: list[tuple[int, int, float]] = []
+        for card in board_state.hand_cards:
+            if not card.playable or card.mana_cost is None:
+                continue
+            snapshot.append((card.mana_cost, card.anchor_center[0], card.ocr_confidence))
+        snapshot.sort(key=lambda item: (item[0], item[1]))
+        return tuple(snapshot)
+
+    def _build_stable_playable_refs(self, board_state: BoardState | None) -> tuple[tuple[int, int], ...]:
+        if board_state is None or not board_state.hand_cards_ready:
+            return ()
+        stable_refs: list[tuple[int, int]] = []
+        for card in board_state.hand_cards:
+            if not card.playable or card.mana_cost is None:
+                continue
+            for prev_cost, prev_x, _prev_conf in self._previous_playable_snapshot:
+                if prev_cost != card.mana_cost:
+                    continue
+                if abs(prev_x - card.anchor_center[0]) <= self.config.play_target_recheck_x_tolerance:
+                    stable_refs.append((card.mana_cost, card.anchor_center[0]))
+                    break
+        stable_refs.sort()
+        return tuple(stable_refs)
+
+    def _resolve_play_card_target(
+        self,
+        board_state: BoardState | None,
+        action_params: dict[str, object],
+    ) -> HandCard | None:
+        if board_state is None:
+            return None
+        card_id = str(action_params.get("card_id"))
+        mana_cost = action_params.get("mana_cost")
+        anchor_center = action_params.get("anchor_center")
+        if isinstance(anchor_center, tuple) and len(anchor_center) == 2:
+            target_x = int(anchor_center[0])
+        else:
+            target_x = None
+
+        playable_cards = [card for card in board_state.hand_cards if card.playable and card.mana_cost is not None]
+        exact = next((card for card in playable_cards if card.card_id == card_id), None)
+        if exact is not None:
+            candidate = exact
+        else:
+            candidate = None
+            if target_x is not None and isinstance(mana_cost, int):
+                nearby_same_cost = [
+                    card
+                    for card in playable_cards
+                    if card.mana_cost == mana_cost and abs(card.anchor_center[0] - target_x) <= self.config.play_target_recheck_x_tolerance
+                ]
+                if nearby_same_cost:
+                    candidate = min(
+                        nearby_same_cost,
+                        key=lambda card: (abs(card.anchor_center[0] - target_x), -card.ocr_confidence),
+                    )
+        if candidate is None:
+            return None
+
+        if target_x is not None:
+            conflicting_neighbors = [
+                card
+                for card in board_state.hand_cards
+                if (
+                    card.card_id != candidate.card_id
+                    and card.mana_cost is not None
+                    and card.mana_cost > board_state.mana_current
+                    and abs(card.anchor_center[0] - candidate.anchor_center[0]) <= self.config.play_target_conflict_x_tolerance
+                )
+            ]
+            stable_hint = bool(action_params.get("stable_hint"))
+            if conflicting_neighbors and not stable_hint:
+                logger.info(
+                    "Skip play_card target due to nearby overcost conflict. chosen_id={} chosen_cost={} chosen_x={} conflict_cards={}",
+                    candidate.card_id,
+                    candidate.mana_cost,
+                    candidate.anchor_center[0],
+                    [
+                        {
+                            "id": card.card_id,
+                            "cost": card.mana_cost,
+                            "x": card.anchor_center[0],
+                        }
+                        for card in conflicting_neighbors
+                    ],
+                )
+                return None
+        return candidate
 
     def _log_scene_normalization(
         self,
@@ -455,6 +550,7 @@ class HearthstoneBot:
 
                 board_state = None
                 unknown_board_state = None
+                stable_playable_refs: tuple[tuple[int, int], ...] = ()
                 end_turn_active_score = get_end_turn_active_score(frame, self.regions["end_turn"])
                 if detection.scene == "unknown" and now >= self._mulligan_grace_until:
                     unknown_board_state = parse_board_state(
@@ -567,6 +663,9 @@ class HearthstoneBot:
                         "Battle debug-only legacy hand candidates (not used for decision): {}",
                         hand_debug_entries,
                     )
+                    if board_state.hand_cards_ready and any(card.playable for card in board_state.hand_cards):
+                        self._last_playable_seen_at = now
+                    stable_playable_refs = self._build_stable_playable_refs(board_state)
                     self._collect_battle_anomaly_sample(
                         frame=frame,
                         scene=detection.scene,
@@ -609,6 +708,9 @@ class HearthstoneBot:
                         self._battle_stall_count = 0
                         self._end_turn_ready_at = 0.0
                         self._end_turn_confirm_count = 0
+                        self._post_play_observe_until = 0.0
+                        self._last_playable_seen_at = 0.0
+                        self._previous_playable_snapshot = ()
                         self._last_ocr_sample_signature = None
                         self._last_trusted_mana_state = None
                         self._last_anomaly_sample_signature = None
@@ -642,6 +744,7 @@ class HearthstoneBot:
                     scene=detection.scene,
                     board_state=board_state,
                     attempted_cards=self._attempted_cards_this_turn,
+                    stable_playable_refs=stable_playable_refs,
                 )
                 if (
                     detection.scene == "battle"
@@ -665,20 +768,28 @@ class HearthstoneBot:
                     )
                 if detection.scene == "battle":
                     logger.info("Chosen action: {}", action.name)
-                if (
-                    action.name == "end_turn"
-                    and (
-                        now < self._end_turn_ready_at
+                if action.name == "end_turn":
+                    recent_playable_left = max(
+                        0.0,
+                        self.config.recent_playable_end_turn_grace_seconds - (now - self._last_playable_seen_at),
+                    ) if self._last_playable_seen_at > 0.0 else 0.0
+                    observe_left = max(0.0, self._post_play_observe_until - now)
+                    cooldown_left = max(0.0, self._end_turn_ready_at - now)
+                    if (
+                        cooldown_left > 0.0
+                        or observe_left > 0.0
+                        or recent_playable_left > 0.0
                         or self._end_turn_confirm_count < self.config.end_turn_confirm_frames
-                    )
-                ):
-                    logger.info(
-                        "Delay end turn. cooldown_left={}s, confirm_frames={}/{}",
-                        round(max(0.0, self._end_turn_ready_at - now), 2),
-                        self._end_turn_confirm_count,
-                        self.config.end_turn_confirm_frames,
-                    )
-                    action = decide_action(scene="matching")
+                    ):
+                        logger.info(
+                            "Delay end turn. cooldown_left={}s, observe_left={}s, recent_playable_left={}s, confirm_frames={}/{}",
+                            round(cooldown_left, 2),
+                            round(observe_left, 2),
+                            round(recent_playable_left, 2),
+                            self._end_turn_confirm_count,
+                            self.config.end_turn_confirm_frames,
+                        )
+                        action = decide_action(scene="matching")
                 if action.name == "click_startup":
                     self._click_match(detection, "startup_entry", fallback_region="startup_entry", pause_seconds=1.0)
                     self._mark_progress(now)
@@ -747,24 +858,38 @@ class HearthstoneBot:
                         self._battle_logged = True
                 elif action.name == "play_card":
                     if self._turn_action_count < self.config.max_actions_per_turn:
-                        drag_start = action.params["drag_start"]
-                        self._last_play_attempt_card_id = str(action.params["card_id"])
-                        logger.info(
-                            "Play card {} from {} with ocr_conf={} cost={}",
-                            self._last_play_attempt_card_id,
-                            drag_start,
-                            round(float(action.params["ocr_confidence"]), 3),
-                            action.params.get("mana_cost"),
-                        )
-                        target = self._board_play_target()
-                        logger.info("Drag target: {}", target)
-                        self.mouse.drag(drag_start, target, duration=0.30)
-                        self._park_mouse()
-                        self._turn_action_count += 1
-                        self._end_turn_ready_at = monotonic() + self.config.post_play_end_turn_delay_seconds
-                        self._end_turn_confirm_count = 0
-                        self._mark_progress(now)
-                        time.sleep(0.8)
+                        verified_card = self._resolve_play_card_target(board_state, action.params)
+                        if verified_card is None:
+                            logger.info(
+                                "Skip play_card after lightweight recheck. card_id={} anchor_center={} cost={} stable_hint={}",
+                                action.params.get("card_id"),
+                                action.params.get("anchor_center"),
+                                action.params.get("mana_cost"),
+                                action.params.get("stable_hint"),
+                            )
+                        else:
+                            drag_start = verified_card.drag_start
+                            self._last_play_attempt_card_id = verified_card.card_id
+                            logger.info(
+                                "Play card {} from {} with ocr_conf={} cost={} stable_hint={}",
+                                self._last_play_attempt_card_id,
+                                drag_start,
+                                round(float(verified_card.ocr_confidence), 3),
+                                verified_card.mana_cost,
+                                action.params.get("stable_hint"),
+                            )
+                            target = self._board_play_target()
+                            logger.info("Drag target: {}", target)
+                            self.mouse.drag(drag_start, target, duration=0.30)
+                            self._park_mouse()
+                            self._turn_action_count += 1
+                            now_after_play = monotonic()
+                            self._end_turn_ready_at = now_after_play + self.config.post_play_end_turn_delay_seconds
+                            self._post_play_observe_until = now_after_play + self.config.post_play_observation_seconds
+                            self._last_playable_seen_at = now_after_play
+                            self._end_turn_confirm_count = 0
+                            self._mark_progress(now)
+                            time.sleep(0.8)
                 elif action.name == "end_turn":
                     logger.info("End turn.")
                     if board_state is not None:
@@ -780,8 +905,11 @@ class HearthstoneBot:
                     self._last_play_attempt_card_id = None
                     self._battle_stall_count = 0
                     self._end_turn_ready_at = 0.0
+                    self._post_play_observe_until = 0.0
                     self._end_turn_confirm_count = 0
                     self._mark_progress(now)
+                if detection.scene == "battle":
+                    self._previous_playable_snapshot = self._build_playable_snapshot(board_state)
                 time.sleep(self.config.poll_interval_seconds)
         finally:
             self.hotkeys.cleanup()

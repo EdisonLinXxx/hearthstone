@@ -51,7 +51,11 @@ class RuntimeConfig:
     max_actions_per_turn: int = 8
     stagnant_timeout_seconds: float = DEFAULT_STAGNANT_TIMEOUT_SECONDS
     post_play_end_turn_delay_seconds: float = 3.0
+    post_play_observation_seconds: float = 1.5
+    recent_playable_end_turn_grace_seconds: float = 2.2
     end_turn_confirm_frames: int = 2
+    play_target_recheck_x_tolerance: int = 36
+    play_target_conflict_x_tolerance: int = 24
     ocr_auto_sample_enabled: bool = True
     ocr_auto_sample_tag: str = "ocr_auto_turn_end"
     ocr_anomaly_sample_enabled: bool = True
