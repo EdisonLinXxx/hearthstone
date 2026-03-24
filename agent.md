@@ -69,6 +69,7 @@
 - battle 异常场景会优先进入 `ocr_anomaly` 采样目录，并写入结构化 `meta.json`，用于后续标注和问题回溯
 - anomaly `meta.json` 现统一保留 ISO 风格 `timestamp` / `captured_at` 与 `timestamp_compact`，并额外记录 `all_trigger_reasons`
 - 可通过 `python -m bot.build_anomaly_manifest --resolution 1440x900 --tag ocr_anomaly` 生成 anomaly 样本索引 CSV，便于批量筛查
+- 同一脚本已支持轻量过滤/汇总，便于直接回答：最近有哪些 `ocr_untrusted`、哪些样本是 `ocr_wait_cost`、哪些样本 `final_cards_count=0` 但 `debug_candidate_count>0`、哪些 reject reason 最常见
 
 ## 5. 当前仍需牢记的风险
 
