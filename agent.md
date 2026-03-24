@@ -1,12 +1,15 @@
 ﻿# Hearthstone Bot Agent Notes
 
-## 1. 项目现状
+## 1. 当前项目状态
 
 这是一个 Windows 前台自动化炉石 Bot。
-当前代码主线已经明确：**battle 决策以 OCR / cost gem 为唯一正式手牌来源**，不再以绿色高亮 playable 作为最终主链路。
+当前代码主线已经明确：
 
-请把这份文档当作“当前真实状态说明”，而不是历史开发日记。
-更新文档时优先保证和 `README.md`、`任务清单.md` 一致，避免割裂。
+- battle 决策以 **OCR / cost gem** 为唯一正式手牌来源
+- legacy 绿色高亮链路仅保留 debug-only 价值
+- OCR 已有第一版拒识、规则校验与异常样本回流闭环
+
+更新文档时，优先保证与 `README.md`、`任务清单.md` 一致，不要让 README 说一套、agent 说一套、代码又是另一套。
 
 ## 2. 当前固定约束
 
@@ -24,7 +27,7 @@
 - 后台输入
 - 中文卡名 OCR
 
-## 3. 关键代码职责边界
+## 3. 关键职责边界
 
 ### `bot/vision/board_state.py`
 - `parse_board_state()` 只负责 battle 基础状态
@@ -36,19 +39,30 @@
 - 负责 cost gem 候选验证
 - 负责把 OCR 结果组装为最终 `hand_cards`
 - 负责 OCR 拒识、规则校验、fallback 语义与运行时处置
+- 负责 anomaly 样本触发与落盘
 
 ### `bot/strategy/rules.py`
 - 只消费 finalized `BoardState`
 - 不重新解释 legacy debug candidates
-- 不再引入额外隐式 fallback
+- 不引入额外隐式 fallback
 
-## 4. 优先级 1-4 当前结论
+### `bot/sampler.py`
+- 负责普通样本与 anomaly 样本的统一落盘
+- 当前已支持 `meta.txt + meta.json`
+- anomaly 样本依赖结构化 `meta.json` 供后续索引和过滤脚本消费
+
+### `bot/build_anomaly_manifest.py`
+- 负责 anomaly 索引构建
+- 负责 anomaly 样本的轻量过滤与汇总
+- 是当前 P5 阶段的主消费入口，不是大而全分析平台
+
+## 4. 优先级 1-5 当前结论
 
 ### P1 统一手牌识别主链路
 已完成。
 - battle 决策使用的最终 `hand_cards` 来源唯一
 - legacy 绿色候选已降级为 debug-only
-- 日志表达已尽量避免“debug 候选”和“最终决策 cards”混淆
+- runtime / rules / board_state 职责边界已收口
 
 ### P2 mana / cost 分离 OCR 配置
 已完成。
@@ -57,8 +71,8 @@
 
 ### P3 cost gem 检测增强
 已完成第一版。
-- 候选 + 验证 两阶段已经落地
-- 目标是降低高密度手牌和特效场景下的漏检/误检
+- 已采用候选 + 验证两阶段
+- 目标是降低高密度手牌和特效干扰下的漏检 / 误检
 
 ### P4 OCR 拒识与规则校验
 已完成第一版。
@@ -66,31 +80,35 @@
 - runtime 已支持 mana/cost 合理范围校验
 - 已支持轻量帧间异常跳变校验
 - OCR 不可信时不会继续驱动出牌
-- battle 异常场景会优先进入 `ocr_anomaly` 采样目录，并写入结构化 `meta.json`，用于后续标注和问题回溯
-- anomaly `meta.json` 现统一保留 ISO 风格 `timestamp` / `captured_at` 与 `timestamp_compact`，并额外记录 `all_trigger_reasons`
-- 可通过 `python -m bot.build_anomaly_manifest --resolution 1440x900 --tag ocr_anomaly` 生成 anomaly 样本索引 CSV，便于批量筛查
-- 同一脚本已支持轻量过滤/汇总，便于直接回答：最近有哪些 `ocr_untrusted`、哪些样本是 `ocr_wait_cost`、哪些样本 `final_cards_count=0` 但 `debug_candidate_count>0`、哪些 reject reason 最常见
 
-## 5. 当前仍需牢记的风险
+### P5 样本标注闭环
+已推进到 P5-3。
+- P5-1：异常优先采样 + anomaly 目录 + `meta.json`
+- P5-2：元信息规范化 + `all_trigger_reasons` + anomaly index
+- P5-3：基于 `build_anomaly_manifest` 的过滤 / 汇总 CLI
 
-- `cost OCR` 仍是模板匹配路线，泛化能力依赖样本覆盖
-- 阈值仍需靠真实对局持续调参
-- `1440x900` 仍应继续作为主验证 profile
-- 攻击逻辑尚未实现
-
-## 6. 修改代码时的原则
+## 5. 当前建议维护原则
 
 - 不要重新引入旧绿色 playable 作为最终 battle hand 决策来源
 - 可以保留 legacy 手段做 debug，但必须明确写成 debug-only
 - 修改日志时优先让“最终决策状态”和“debug 观察信息”分开
-- 如果改 `runtime.py`，优先把 OCR 可信性与 fallback 语义收敛到统一入口
-- 如果改 `board_state.py`，优先保持 battle base state 纯净
-- 如果改 OCR，优先补样本，其次再调模板匹配和阈值
-- OCR CSV 中优先使用仓库相对路径，避免新数据继续制造迁移负担
+- 改 OCR 逻辑时，优先考虑：
+  1. 样本是否足够
+  2. anomaly 是否已被采集到
+  3. reject / trigger reason 是否能被复盘
+- 不要把 P5 工具误做成复杂平台；当前目标是“小而实用、马上能排障”
+
+## 6. 当前仍需牢记的风险
+
+- `cost OCR` 仍是模板匹配路线，泛化依赖样本覆盖
+- 阈值仍需靠真实对局持续调参
+- `1440x900` 仍应继续作为主验证 profile
+- 当前 anomaly 工具偏离线，仍不是完整统计系统
+- 攻击逻辑尚未实现
 
 ## 7. 推荐下一步
 
-1. 继续积累 `1440x900` 实战样本
-2. 持续补标 mana / cost 数据集
-3. 观察 priority 4 拒识是否过于保守或过于宽松
-4. OCR 链路稳定后，再推进攻击逻辑
+1. 先跑实战，积累 anomaly 样本
+2. 用 `bot.build_anomaly_manifest` 查高频 trigger / reject reason
+3. 定向补标并回看对应样本
+4. 再决定是继续推进 P5-4，还是回头调 OCR / gem 阈值
