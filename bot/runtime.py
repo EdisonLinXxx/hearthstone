@@ -539,7 +539,7 @@ class HearthstoneBot:
                     elif board_state.hand_cards_ready and any(card.playable for card in board_state.hand_cards):
                         self._battle_stall_count += 1
                     logger.info(
-                        "Battle state: hand_source={} ready={} trusted={} reject_reasons={} detected_cards={}, mana={}/{}, end_turn_active_score={}, stall_count={}, hand_cards={}, attempted={}",
+                        "Battle decision state: source={} ready={} trusted={} reject_reasons={} final_cards={}, mana={}/{}, end_turn_active_score={}, stall_count={}, hand_cards={}, attempted={}",
                         board_state.hand_source,
                         board_state.hand_cards_ready,
                         board_state.ocr_trusted,
@@ -560,7 +560,10 @@ class HearthstoneBot:
                         ],
                         sorted(self._attempted_cards_this_turn),
                     )
-                    logger.debug("Battle hand debug candidates: {}", hand_debug_entries)
+                    logger.debug(
+                        "Battle debug-only legacy hand candidates (not used for decision): {}",
+                        hand_debug_entries,
+                    )
                     if board_state.can_end_turn and now >= self._end_turn_ready_at:
                         self._end_turn_confirm_count += 1
                     else:
@@ -721,7 +724,7 @@ class HearthstoneBot:
                 elif action.name == "battle_wait":
                     if not self._battle_logged:
                         logger.info(
-                            "Battle wait. reason={} hand_source={} ready={} mana={}/{}, cards={}",
+                            "Battle wait. reason={} decision_source={} ready={} mana={}/{}, final_cards={}",
                             action.params.get("reason"),
                             board_state.hand_source if board_state is not None else None,
                             board_state.hand_cards_ready if board_state is not None else None,
@@ -1025,6 +1028,13 @@ class HearthstoneBot:
         board_state: BoardState,
         hand_debug_entries: list[dict[str, object]] | None = None,
     ) -> BoardState:
+        """Attach OCR-derived mana + hand cards onto battle base state.
+
+        parse_board_state() only provides battle base status. Final battle
+        hand_cards are produced here from the OCR/cost-gem path only. Legacy
+        green-highlight detections may be logged as debug hints, but are never
+        promoted into the returned hand_cards.
+        """
         mana_current, mana_total, mana_confidence, mana_reasons = self._recognize_mana_text(
             frame,
             can_end_turn=board_state.can_end_turn,
@@ -1041,24 +1051,23 @@ class HearthstoneBot:
         final_mana_total = mana_total if mana_total is not None else board_state.mana_total
 
         if mana_current is None or mana_total is None:
-            hand_source = "ocr_missing_mana"
-        elif cost_reasons and not ocr_hand_cards and debug_candidate_count > 0:
-            hand_source = "ocr_untrusted_cost"
-            reject_reasons.extend(cost_reasons)
+            hand_source = "ocr_wait_mana"
         elif ocr_hand_cards:
             hand_cards_ready = True
-            hand_source = "ocr"
+            hand_source = "ocr_cards"
             ocr_trusted = True
+            reject_reasons.extend(cost_reasons)
         elif debug_candidate_count > 0:
-            hand_source = "ocr_missing_cost"
+            hand_source = "ocr_wait_cost"
             reject_reasons.extend(cost_reasons)
         else:
             hand_cards_ready = True
-            hand_source = "ocr_empty"
+            hand_source = "ocr_empty_trusted"
             ocr_trusted = True
+            reject_reasons.extend(cost_reasons)
 
         logger.debug(
-            "OCR state: mana={}/{} conf={} trusted={} source={} ready={} mana_reasons={} cost_reasons={} debug_candidates={} cards={}",
+            "OCR decision input: mana={}/{} conf={} trusted={} source={} ready={} mana_reasons={} cost_reasons={} debug_candidate_count={} final_cards={}",
             final_mana_current,
             final_mana_total,
             round(mana_confidence, 3),

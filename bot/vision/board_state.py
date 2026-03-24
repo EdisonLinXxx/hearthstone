@@ -49,6 +49,12 @@ class HandCandidate:
 
 @dataclass(frozen=True)
 class ScoredHandCandidate:
+    """Legacy green-highlight hand scoring, retained for debug/inspection only.
+
+    These scores are intentionally not used to build final battle hand_cards.
+    Runtime hand decisions must come from the OCR/cost-gem pipeline.
+    """
+
     candidate: HandCandidate
     card_score: float
     playable_score: float
@@ -445,41 +451,17 @@ def _score_playable_candidate(
     )
 
 
-def _candidate_to_hand_card(
-    hand_region: Region,
-    scored_candidate: ScoredHandCandidate,
-    config: HandDetectionConfig,
-) -> HandCard:
-    x, y = scored_candidate.candidate.center
-    global_x = hand_region.x + x
-    global_y = hand_region.y + y
-    _, bbox_y, _, bbox_h = scored_candidate.candidate.bbox
-    anchor_offset = max(10, int(bbox_h * config.drag_anchor_from_bottom_ratio))
-    drag_y = hand_region.y + bbox_y + bbox_h - anchor_offset
-    drag_start = (
-        global_x,
-        max(hand_region.y + 8, min(hand_region.y + hand_region.h - 20, drag_y)),
-    )
-    return HandCard(
-        card_id=f"{global_x}:{global_y}",
-        anchor_center=(global_x, global_y),
-        drag_start=drag_start,
-        bbox=(
-            hand_region.x + scored_candidate.candidate.bbox[0],
-            hand_region.y + scored_candidate.candidate.bbox[1],
-            scored_candidate.candidate.bbox[2],
-            scored_candidate.candidate.bbox[3],
-        ),
-        playable_score=0.0,
-        playable=False,
-    )
-
-
 def build_hand_debug_entries(
     frame: np.ndarray,
     hand_region: Region,
     hand_config: HandDetectionConfig,
 ) -> list[dict[str, object]]:
+    """Build legacy green-highlight hand candidates for debug only.
+
+    The returned entries are for logging / visual inspection so we can compare
+    old highlight heuristics against the OCR pipeline. They must not be treated
+    as final battle hand_cards or as a fallback decision source.
+    """
     hand_image = crop_region(frame, hand_region)
     green_mask = _build_hand_green_mask(hand_image, hand_config)
     raw_candidates = _collect_raw_hand_candidates(hand_image, green_mask, hand_config)

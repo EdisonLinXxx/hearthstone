@@ -16,6 +16,12 @@ def decide_action(
     board_state: BoardState | None = None,
     attempted_cards: set[str] | None = None,
 ) -> Action:
+    """Decide runtime action from normalized scene + battle state.
+
+    In battle, playable hand_cards must already be finalized upstream by the
+    OCR/cost pipeline. This layer should not reinterpret legacy debug candidates
+    or invent additional hand fallbacks.
+    """
     if scene == "startup":
         return Action("click_startup")
     if scene == "main_menu":
