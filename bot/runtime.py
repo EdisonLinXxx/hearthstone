@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from time import monotonic
 
 import cv2
@@ -87,6 +88,8 @@ class HearthstoneBot:
         self._end_turn_confirm_count = 0
         self._last_ocr_sample_signature: tuple[int, tuple[str, ...]] | None = None
         self._last_trusted_mana_state: tuple[int, int, bool] | None = None
+        self._last_anomaly_sample_signature: tuple[str, str, int, int] | None = None
+        self._last_anomaly_sample_at = 0.0
 
     def _board_play_target(self) -> tuple[int, int]:
         return (
@@ -564,6 +567,13 @@ class HearthstoneBot:
                         "Battle debug-only legacy hand candidates (not used for decision): {}",
                         hand_debug_entries,
                     )
+                    self._collect_battle_anomaly_sample(
+                        frame=frame,
+                        scene=detection.scene,
+                        board_state=board_state,
+                        hand_debug_entries=hand_debug_entries,
+                        now=now,
+                    )
                     if board_state.can_end_turn and now >= self._end_turn_ready_at:
                         self._end_turn_confirm_count += 1
                     else:
@@ -601,6 +611,8 @@ class HearthstoneBot:
                         self._end_turn_confirm_count = 0
                         self._last_ocr_sample_signature = None
                         self._last_trusted_mana_state = None
+                        self._last_anomaly_sample_signature = None
+                        self._last_anomaly_sample_at = 0.0
                     if detection.scene in {"main_menu", "battle_menu", "queue_page", "matching"}:
                         self._last_battle_seen_at = 0.0
                     if detection.scene not in {"queue_page", "matching", "match_error"}:
@@ -863,6 +875,123 @@ class HearthstoneBot:
             self._result_click_count += 1
         self._pending_traditional_battle = False
         self._queue_step = 1
+
+    def _build_battle_sample_metadata(
+        self,
+        *,
+        sample_id: str,
+        trigger_reason: str,
+        scene: str,
+        board_state: BoardState,
+        hand_debug_entries: list[dict[str, object]] | None = None,
+    ) -> dict[str, object]:
+        hand_debug_entries = hand_debug_entries or []
+        return {
+            "sample_id": sample_id,
+            "timestamp": datetime.now().isoformat(timespec="milliseconds"),
+            "resolution": f"{self.config.window_width}x{self.config.window_height}",
+            "profile": self.config.asset_profile,
+            "scene": scene,
+            "hand_source": board_state.hand_source,
+            "hand_cards_ready": board_state.hand_cards_ready,
+            "ocr_trusted": board_state.ocr_trusted,
+            "ocr_reject_reasons": list(board_state.ocr_reject_reasons),
+            "mana_current": board_state.mana_current,
+            "mana_total": board_state.mana_total,
+            "final_cards_count": len(board_state.hand_cards),
+            "debug_candidate_count": len(hand_debug_entries),
+            "trigger_reason": trigger_reason,
+        }
+
+    def _detect_battle_anomaly_trigger(
+        self,
+        board_state: BoardState,
+        hand_debug_entries: list[dict[str, object]] | None = None,
+    ) -> str | None:
+        hand_debug_entries = hand_debug_entries or []
+        reject_reasons = tuple(board_state.ocr_reject_reasons)
+        reason_text = "|".join(reject_reasons)
+
+        if board_state.hand_source == "ocr_wait_mana":
+            if any("jump:" in reason or "_out_of_range:" in reason or "_gt_total:" in reason for reason in reject_reasons):
+                return "mana_validation_failed"
+            if reject_reasons:
+                return "ocr_wait_mana"
+        if board_state.hand_source == "ocr_wait_cost":
+            return "ocr_wait_cost"
+        if not board_state.hand_cards_ready:
+            return f"hand_cards_not_ready:{board_state.hand_source}"
+        if not board_state.ocr_trusted:
+            return "ocr_untrusted"
+        if len(hand_debug_entries) > 0 and len(board_state.hand_cards) == 0:
+            return "legacy_candidates_without_final_cards"
+        if "cost_reject:" in reason_text:
+            return "cost_ocr_untrusted"
+        return None
+
+    def _collect_battle_anomaly_sample(
+        self,
+        *,
+        frame: np.ndarray,
+        scene: str,
+        board_state: BoardState,
+        hand_debug_entries: list[dict[str, object]] | None,
+        now: float,
+    ) -> None:
+        if not self.config.ocr_anomaly_sample_enabled:
+            return
+        trigger_reason = self._detect_battle_anomaly_trigger(board_state, hand_debug_entries)
+        if trigger_reason is None:
+            return
+
+        debug_candidate_count = len(hand_debug_entries or [])
+        signature = (
+            trigger_reason,
+            board_state.hand_source,
+            len(board_state.hand_cards),
+            debug_candidate_count,
+        )
+        if signature == self._last_anomaly_sample_signature:
+            if (now - self._last_anomaly_sample_at) < self.config.ocr_anomaly_sample_cooldown_seconds:
+                return
+
+        sample_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        try:
+            window = self.capture.find_window()
+            extra_crops = self._build_hand_cost_sample_crops(frame, board_state)
+            metadata = self._build_battle_sample_metadata(
+                sample_id=sample_id,
+                trigger_reason=trigger_reason,
+                scene=scene,
+                board_state=board_state,
+                hand_debug_entries=hand_debug_entries,
+            )
+            self.sampler.collect_from_frame(
+                tag=self.config.ocr_anomaly_sample_tag,
+                frame=frame,
+                window=window,
+                include_regions=True,
+                region_names=["mana", "hand"],
+                metadata=metadata,
+                extra_crops=extra_crops,
+                sample_id=sample_id,
+            )
+            self._last_anomaly_sample_signature = signature
+            self._last_anomaly_sample_at = now
+            logger.warning(
+                "Captured OCR anomaly sample. sample_id={} trigger_reason={} source={} ready={} trusted={} final_cards={} debug_candidates={} mana={}/{}",
+                sample_id,
+                trigger_reason,
+                board_state.hand_source,
+                board_state.hand_cards_ready,
+                board_state.ocr_trusted,
+                len(board_state.hand_cards),
+                debug_candidate_count,
+                board_state.mana_current,
+                board_state.mana_total,
+            )
+        except Exception as exc:
+            logger.warning("OCR anomaly sample failed. trigger_reason={} error={}", trigger_reason, exc)
 
     def _collect_ocr_turn_end_sample(
         self,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from pathlib import Path
 
@@ -44,12 +45,14 @@ class SampleCollector:
         region_names: list[str] | None = None,
         metadata: dict[str, object] | None = None,
         extra_crops: dict[str, object] | None = None,
+        sample_id: str | None = None,
     ) -> list[Path]:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        sample_id = sample_id or timestamp
         output_dir = self._base_output_dir(tag)
 
         saved_paths: list[Path] = []
-        full_path = output_dir / f"{timestamp}_full.png"
+        full_path = output_dir / f"{sample_id}_full.png"
         self.capture.to_pil_image(frame).save(full_path)
         saved_paths.append(full_path)
 
@@ -60,16 +63,33 @@ class SampleCollector:
                 if region is None:
                     continue
                 region_frame = self.capture.crop_region(frame, region)
-                region_path = output_dir / f"{timestamp}_{name}.png"
+                region_path = output_dir / f"{sample_id}_{name}.png"
                 self.capture.to_pil_image(region_frame).save(region_path)
                 saved_paths.append(region_path)
 
         for name, crop in (extra_crops or {}).items():
-            crop_path = output_dir / f"{timestamp}_{name}.png"
+            crop_path = output_dir / f"{sample_id}_{name}.png"
             self.capture.to_pil_image(crop).save(crop_path)
             saved_paths.append(crop_path)
 
+        metadata_payload: dict[str, object] = {
+            "sample_id": sample_id,
+            "timestamp": timestamp,
+            "tag": tag,
+            "window": {
+                "title": window.title,
+                "left": window.left,
+                "top": window.top,
+                "width": window.width,
+                "height": window.height,
+            },
+            "profile": self.config.asset_profile,
+        }
+        metadata_payload.update(metadata or {})
+
         metadata_lines = [
+            f"sample_id={sample_id}",
+            f"timestamp={timestamp}",
             f"tag={tag}",
             f"title={window.title}",
             f"left={window.left}",
@@ -81,8 +101,15 @@ class SampleCollector:
         for key, value in (metadata or {}).items():
             metadata_lines.append(f"{key}={value}")
 
-        metadata_path = output_dir / f"{timestamp}_meta.txt"
+        metadata_path = output_dir / f"{sample_id}_meta.txt"
         metadata_path.write_text("\n".join(metadata_lines), encoding="utf-8")
         saved_paths.append(metadata_path)
-        logger.info("Saved {} sample files to {}", len(saved_paths), output_dir)
+
+        metadata_json_path = output_dir / f"{sample_id}_meta.json"
+        metadata_json_path.write_text(
+            json.dumps(metadata_payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        saved_paths.append(metadata_json_path)
+        logger.info("Saved {} sample files to {} (sample_id={})", len(saved_paths), output_dir, sample_id)
         return saved_paths

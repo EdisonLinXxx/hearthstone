@@ -54,6 +54,9 @@ class RuntimeConfig:
     end_turn_confirm_frames: int = 2
     ocr_auto_sample_enabled: bool = True
     ocr_auto_sample_tag: str = "ocr_auto_turn_end"
+    ocr_anomaly_sample_enabled: bool = True
+    ocr_anomaly_sample_tag: str = "ocr_anomaly"
+    ocr_anomaly_sample_cooldown_seconds: float = 5.0
 
     @property
     def regions_path(self) -> Path:
